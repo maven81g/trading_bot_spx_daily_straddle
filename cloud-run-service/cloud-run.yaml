@@ -1,0 +1,127 @@
+# Cloud Run service configuration for Trading Bot
+# This file can be used with `gcloud run services replace cloud-run.yaml`
+
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: trading-bot
+  labels:
+    app: trading-bot
+    environment: production
+  annotations:
+    run.googleapis.com/description: "SPX Trading Bot for automated options trading"
+    run.googleapis.com/launch-stage: GA
+spec:
+  template:
+    metadata:
+      labels:
+        app: trading-bot
+        version: v1
+      annotations:
+        # Scaling configuration
+        autoscaling.knative.dev/maxScale: "1"
+        autoscaling.knative.dev/minScale: "0"
+        
+        # Resource allocation
+        run.googleapis.com/memory: "1Gi"
+        run.googleapis.com/cpu: "1000m"
+        
+        # Execution environment
+        run.googleapis.com/execution-environment: gen2
+        
+        # Request timeout (1 hour for long-running bot)
+        run.googleapis.com/timeout: "3600s"
+        
+        # Health checks
+        run.googleapis.com/health-check-path: "/health"
+        
+    spec:
+      # Service account for accessing secrets and other GCP services
+      serviceAccountName: trading-bot-service-account
+      
+      # Request timeout
+      timeoutSeconds: 3600
+      
+      containers:
+      - name: trading-bot
+        image: gcr.io/PROJECT_ID/trading-bot:latest
+        
+        ports:
+        - containerPort: 8080
+          name: http1
+          
+        env:
+        - name: NODE_ENV
+          value: "production"
+        - name: PORT
+          value: "8080"
+        - name: LOG_LEVEL
+          value: "info"
+        - name: PAPER_TRADING
+          value: "true"
+        - name: MAX_DAILY_LOSS
+          value: "1000"
+        - name: MAX_DRAWDOWN
+          value: "2000"
+        - name: MAX_POSITIONS
+          value: "5"
+          
+        # Environment variables from Secret Manager
+        - name: TRADESTATION_CLIENT_ID
+          valueFrom:
+            secretKeyRef:
+              name: tradestation-client-id
+              key: latest
+        - name: TRADESTATION_CLIENT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: tradestation-client-secret
+              key: latest
+        - name: TRADESTATION_REFRESH_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: tradestation-refresh-token
+              key: latest
+              
+        # Resource requests and limits
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "500m"
+          limits:
+            memory: "1Gi"
+            cpu: "1000m"
+            
+        # Liveness probe
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
+          
+        # Readiness probe  
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+          
+        # Startup probe (for slow-starting services)
+        startupProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 30  # Allow up to 5 minutes for startup
+          
+  traffic:
+  - percent: 100
+    latestRevision: true

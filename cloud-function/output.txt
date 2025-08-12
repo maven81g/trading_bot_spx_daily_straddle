@@ -1,0 +1,66 @@
+🧪 SPX Daily Reporter - Local Test
+NaN
+📋 Checking environment variables...
+✅ All environment variables are set
+
+🎯 Initializing SPX Daily Reporter...
+📊 BigQuery client initialized: galvanic-ripsaw-381707.spx_trading
+📧 Mailgun client initialized for domain: sandboxabd41b3728e64b64bd08b04b93c7d783.mailgun.org
+🎯 SPX Daily Reporter initialized
+📅 Test date: Wed Aug 06 2025
+
+🚀 Running daily analysis...
+🚀 Starting daily analysis for Wed Aug 06 2025
+🔐 Authenticating with TradeStation...
+✅ TradeStation authentication successful
+📊 Fetching SPX data for 2025-08-06...
+🔗 URL: https://sim-api.tradestation.com/v3/marketdata/barcharts/$SPXW.X?unit=minute&firstdate=2025-08-06T13:30:00Z&lastdate=2025-08-06T21:00:00Z
+⏰ Start time: 2025-08-06T13:30:00Z, End time: 2025-08-06T21:00:00Z
+✅ Fetched 392 SPX bars
+📊 Processing 392 SPX bars
+🎯 Identified 7 potential strikes
+📊 Fetching option data for 7 strikes...
+✅ Loaded 204 bars for SPXW 250806C6290
+✅ Loaded 191 bars for SPXW 250806C6295
+✅ Loaded 295 bars for SPXW 250806C6300
+✅ Loaded 294 bars for SPXW 250806C6305
+✅ Loaded 355 bars for SPXW 250806C6310
+✅ Loaded 341 bars for SPXW 250806C6315
+✅ Loaded 376 bars for SPXW 250806C6320
+📊 Successfully loaded option data for 7 strikes
+💾 Storing daily summary to BigQuery...
+✅ Daily summary stored for 2025-08-06
+✅ Data stored to BigQuery successfully
+📊 Querying last 10 daily summaries...
+✅ Retrieved 15 recent summaries
+📧 Sending daily summary email to ulises81g@gmail.com...
+✅ Email sent successfully: <20250809180519.b3e7f776f7b262ae@sandboxabd41b3728e64b64bd08b04b93c7d783.mailgun.org>
+✅ Email summary sent successfully
+✅ Daily analysis completed for Wed Aug 06 2025
+
+📊 TEST RESULTS:
+NaN
+Execution Time: 3.98s
+Date: 2025-08-06
+Strategy: MACD_Momentum
+SPX Bars: 392
+Total Trades: 0
+Win Rate: 0.0%
+Net P&L: $0.00
+API Requests: 8
+BigQuery Stored: ✅
+Email Sent: ✅
+
+ℹ️  No trades executed
+
+📈 MARKET DATA:
+SPX Open: 6305.77
+SPX Close: 6345.06
+Daily Change: +39.29 (+0.62%)
+
+✅ Local test completed successfully!
+
+💡 NEXT STEPS:
+1. Check your email for the summary report
+2. Verify data in BigQuery console
+3. If everything looks good, deploy with: ./deploy.sh

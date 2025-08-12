@@ -1,0 +1,3 @@
+  gcloud functions deploy spx-macd-strategy-analysis --runtime nodejs22 --trigger-http --entry-point main --memory 512MB --timeout 540s --region us-central1 --allow-unauthenticated
+
+   There is logic missing the stop loss. If there is negative cross over signal exit the trade. don't wait to hit 20% stop loss

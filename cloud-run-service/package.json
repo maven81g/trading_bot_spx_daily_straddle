@@ -1,0 +1,36 @@
+{
+  "name": "trading-bot-service",
+  "version": "1.0.0",
+  "description": "Trading Bot Cloud Run Service with HTTP endpoints",
+  "main": "bot-service.js",
+  "scripts": {
+    "start": "node bot-service.js",
+    "dev": "ts-node bot-service.ts",
+    "build": "tsc --project ../tsconfig.json"
+  },
+  "dependencies": {
+    "winston": "^3.10.0",
+    "dotenv": "^16.3.1",
+    "axios": "^1.5.0",
+    "ws": "^8.14.0",
+    "uuid": "^9.0.0",
+    "lodash": "^4.17.21",
+    "@google-cloud/bigquery": "^7.3.0",
+    "express": "^4.18.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.5.0",
+    "@types/express": "^4.17.17",
+    "typescript": "^5.1.6",
+    "ts-node": "^10.9.1"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "keywords": [
+    "trading-bot",
+    "cloud-run",
+    "tradestation",
+    "algorithmic-trading"
+  ]
+}
