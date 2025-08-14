@@ -55,7 +55,7 @@ async function runLocalBot() {
         accountId: process.env.TRADESTATION_ACCOUNT_ID
       },
       logging: {
-        level: (process.env.LOG_LEVEL as any) || 'info',
+        level: process.env.TESTING === 'true' ? 'debug' : (process.env.LOG_LEVEL as any) || 'info',
         file: process.env.LOG_FILE || './logs/trading-bot.log'
       }
     };
@@ -115,6 +115,38 @@ async function runLocalBot() {
 
     // Start the bot
     await bot.start();
+
+    // Add periodic dashboard-style status logging for local testing (every 2 minutes)
+    console.log('\n📊 Dashboard mode enabled - Status updates every 2 minutes');
+    console.log('🔍 Verbose logging enabled for strategy verification\n');
+    
+    setInterval(async () => {
+      try {
+        const status = await bot.getDetailedStatus();
+        
+        console.log('\n╔══════════════════════════════════════════════════════════════╗');
+        console.log('║                  📊 TRADING BOT STATUS                        ║');
+        console.log('╠══════════════════════════════════════════════════════════════╣');
+        console.log(`║ ⏰ Time: ${new Date().toLocaleTimeString('en-US', { timeZone: 'America/New_York' })} ET | Uptime: ${status.uptime.padEnd(20)}║`);
+        console.log(`║ 📈 Trades: ${status.totalTrades.toString().padEnd(3)} | Daily P&L: $${status.dailyPnL.toFixed(2).padEnd(10)}            ║`);
+        console.log('╠══════════════════════════════════════════════════════════════╣');
+        
+        if (status.currentPosition) {
+          console.log('║ 🎯 ACTIVE POSITION:                                          ║');
+          console.log(`║   Symbol: ${status.currentPosition.symbol.padEnd(20)}                       ║`);
+          console.log(`║   Entry: $${status.currentPosition.entryPrice.toFixed(2)} | Current: $${(status.currentPosition.currentPrice || 0).toFixed(2)}                    ║`);
+          console.log(`║   P&L: $${(status.currentPosition.unrealizedPnL || 0).toFixed(2)} (${((status.currentPosition.unrealizedPnL || 0) / (status.currentPosition.entryPrice * 100) * 100).toFixed(1)}%)                                   ║`);
+          const holdTime = Math.floor((Date.now() - new Date(status.currentPosition.entryTime).getTime()) / 60000);
+          console.log(`║   Hold Time: ${holdTime} minutes                                      ║`);
+        } else {
+          console.log('║ 🎯 No active positions - Monitoring for signals...           ║');
+        }
+        
+        console.log('╚══════════════════════════════════════════════════════════════╝\n');
+      } catch (error) {
+        console.error('Error getting status:', error);
+      }
+    }, 2 * 60 * 1000); // Every 2 minutes for testing
 
     // Keep the process alive
     setInterval(() => {

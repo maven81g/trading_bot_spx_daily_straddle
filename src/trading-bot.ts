@@ -165,6 +165,12 @@ export class TradingBot extends EventEmitter {
       throw new Error('Authentication failed');
     }
 
+    // Pass the authentication token to the streaming client
+    const token = this.apiClient.getToken();
+    if (token) {
+      this.streamingClient.setAuthToken(token);
+    }
+
     this.logger.info('✅ Authentication successful');
   }
 
@@ -217,11 +223,37 @@ export class TradingBot extends EventEmitter {
       
       // Need at least 26 bars for MACD
       if (this.spxBars.length < 26) {
+        if (this.spxBars.length % 5 === 0) {
+          this.logger.info(`📊 Collecting bars: ${this.spxBars.length}/26 needed for MACD`);
+        }
         return;
       }
       
       // Calculate MACD
       const macd = this.calculateMACD();
+      
+      // Verbose logging for testing (every 5th bar to avoid spam)
+      const barCount = this.spxBars.length;
+      if (barCount % 5 === 0 || Math.abs(macd.macd) <= this.config.strategy.macdThreshold * 1.2) {
+        this.logger.debug(`📊 Bar ${barCount} | SPX: $${bar.Close} | MACD: ${macd.macd.toFixed(4)} | Signal: ${macd.signal.toFixed(4)} | Hist: ${macd.histogram.toFixed(4)}`);
+        
+        // Log when approaching entry threshold
+        if (!this.currentPosition && Math.abs(macd.macd - this.config.strategy.macdThreshold) < 0.5) {
+          this.logger.info(`⚠️ Approaching entry threshold | MACD: ${macd.macd.toFixed(4)} (threshold: ${this.config.strategy.macdThreshold})`);
+          
+          // Check histogram trend
+          if (this.histogramHistory.length >= 3) {
+            const trend = this.isHistogramIncreasing(macd.histogram) ? '📈 INCREASING' : '📉 DECREASING';
+            const last4 = [...this.histogramHistory.slice(-3), macd.histogram];
+            this.logger.info(`   Histogram trend: ${trend} | Last 4: [${last4.map(h => h.toFixed(4)).join(', ')}]`);
+          }
+          
+          // Check crossover status
+          if (macd.crossover !== 'none') {
+            this.logger.info(`   🔄 Crossover detected: ${macd.crossover.toUpperCase()}`);
+          }
+        }
+      }
       
       // Check for signals
       if (!this.currentPosition) {
@@ -295,17 +327,35 @@ export class TradingBot extends EventEmitter {
       return;
     }
     
+    // Log entry condition checks for debugging
+    const condition1 = macd.macd <= this.config.strategy.macdThreshold;
+    const condition2 = macd.crossover === 'bullish';
+    const condition3 = this.isHistogramIncreasing(macd.histogram);
+    
+    // Log when any condition is met (for testing)
+    if (condition1 || condition2 || condition3) {
+      this.logger.debug(`🔍 Entry Check at ${new Date(bar.TimeStamp).toLocaleTimeString('en-US', { timeZone: 'America/New_York' })} ET:`);
+      this.logger.debug(`   ✅ MACD ≤ ${this.config.strategy.macdThreshold}: ${condition1} (current: ${macd.macd.toFixed(4)})`);
+      this.logger.debug(`   ✅ Bullish crossover: ${condition2} (${macd.crossover})`);
+      this.logger.debug(`   ✅ Histogram increasing: ${condition3} (last 4: [${[...this.histogramHistory.slice(-3), macd.histogram].map(h => h.toFixed(4)).join(', ')}])`);
+    }
+    
     // Check all entry conditions
-    if (macd.macd <= this.config.strategy.macdThreshold && 
-        macd.crossover === 'bullish' &&
-        this.isHistogramIncreasing(macd.histogram)) {
-      
-      this.logger.info(`📈 Entry signal detected: Bullish MACD crossover with increasing histogram`);
-      this.logger.info(`   SPX: ${bar.Close}, MACD: ${macd.macd.toFixed(4)}, Signal: ${macd.signal.toFixed(4)}, Hist: ${macd.histogram.toFixed(4)}`);
-      this.logger.info(`   Last 4 histograms: ${[...this.histogramHistory.slice(-3), macd.histogram].map(h => h.toFixed(4)).join(', ')}`);
+    if (condition1 && condition2 && condition3) {
+      this.logger.info(`\n🎯 ═══════════════ ENTRY SIGNAL TRIGGERED ═══════════════`);
+      this.logger.info(`📈 All conditions met for entry:`);
+      this.logger.info(`   ✅ MACD (${macd.macd.toFixed(4)}) ≤ threshold (${this.config.strategy.macdThreshold})`);
+      this.logger.info(`   ✅ Bullish crossover detected`);
+      this.logger.info(`   ✅ Histogram increasing over last 4 bars`);
+      this.logger.info(`   SPX Price: $${bar.Close}`);
+      this.logger.info(`   MACD: ${macd.macd.toFixed(4)} | Signal: ${macd.signal.toFixed(4)} | Histogram: ${macd.histogram.toFixed(4)}`);
+      this.logger.info(`   Last 4 histograms: ${[...this.histogramHistory.slice(-3), macd.histogram].map(h => h.toFixed(4)).join(' → ')}`);
       
       // Find appropriate option strike (round DOWN to nearest 5, matching backtest)
       const strike = Math.floor(parseFloat(bar.Close) / 5) * 5; // Round DOWN to nearest 5
+      this.logger.info(`   Selected Strike: $${strike} (0DTE Call)`);
+      this.logger.info(`═══════════════════════════════════════════════════\n`);
+      
       await this.enterPosition(strike, parseFloat(bar.Close));
     }
     
