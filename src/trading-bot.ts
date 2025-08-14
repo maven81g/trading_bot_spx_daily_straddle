@@ -585,6 +585,76 @@ export class TradingBot extends EventEmitter {
       this.logger.error('Streaming error:', error);
       this.emit('error', error);
     });
+
+    // Bar data events - CRITICAL: Handle SPX bar updates
+    this.streamingClient.on('bar', (data: any) => {
+      this.handleBarUpdate(data);
+    });
+
+    // Quote data events - For option price monitoring
+    this.streamingClient.on('quote', (data: any) => {
+      this.handleQuoteUpdate(data);
+    });
+  }
+
+  // Event handlers for streaming data
+  private handleBarUpdate(data: any): void {
+    // Handle SPX bar updates - this gives us proper 1-minute consolidated prices
+    if (data.bar && data.symbol === this.config.strategy.spxSymbol) {
+      const bar = data.bar;
+      this.onSpxBar(bar).catch(error => {
+        this.logger.error('Error processing SPX bar:', error);
+      });
+    }
+  }
+
+  private handleQuoteUpdate(data: any): void {
+    // Handle option quote updates for position monitoring
+    if (this.currentPosition && data.quote) {
+      const quote = data.quote;
+      const symbol = data.symbol || quote.Symbol;
+      
+      if (symbol === this.currentPosition.symbol) {
+        const currentPrice = Number(quote.Last || quote.Close || 0);
+        if (currentPrice > 0) {
+          this.currentPosition.currentPrice = currentPrice;
+          this.currentPosition.unrealizedPnL = 
+            (currentPrice - this.currentPosition.entryPrice) * this.currentPosition.quantity * 100;
+          
+          this.logger.debug(`Option price update: ${symbol} = $${currentPrice.toFixed(2)}, P&L: $${this.currentPosition.unrealizedPnL.toFixed(2)}`);
+          
+          // Check exit conditions
+          this.checkExitConditions().catch(error => {
+            this.logger.error('Error checking exit conditions:', error);
+          });
+        }
+      }
+    }
+  }
+
+  // Exit condition checking method
+  private async checkExitConditions(): Promise<void> {
+    if (!this.currentPosition || !this.currentPosition.currentPrice) return;
+
+    const pnl = this.currentPosition.unrealizedPnL || 0;
+    const pnlPercent = pnl / (this.currentPosition.entryPrice * this.currentPosition.quantity * 100);
+    
+    let exitReason: string | null = null;
+    
+    // Check profit target
+    if (pnl >= this.config.strategy.profitTarget) {
+      exitReason = 'Profit target reached';
+    } 
+    // Check stop loss
+    else if (pnlPercent <= -this.config.strategy.stopLossPercentage) {
+      exitReason = `Stop loss triggered (${(pnlPercent * 100).toFixed(1)}% loss)`;
+    }
+    
+    if (exitReason) {
+      this.logger.info(`📉 Exit signal: ${exitReason}`);
+      this.logger.info(`   P&L: $${pnl.toFixed(2)} (${(pnlPercent * 100).toFixed(1)}%)`);
+      await this.closePosition(exitReason);
+    }
   }
 
   // Status and monitoring methods

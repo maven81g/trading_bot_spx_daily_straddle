@@ -63,5 +63,5 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
 # Use dumb-init to handle signals properly
 ENTRYPOINT ["dumb-init", "--"]
 
-# Start the main app with Cloud Run mode enabled
-CMD ["node", "dist/index.js"]
+# Start the straddle bot with Cloud Run mode enabled
+CMD ["node", "dist/index-straddle.js"]

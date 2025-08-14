@@ -8,7 +8,7 @@ set -e  # Exit on any error
 # Configuration
 PROJECT_ID=${GOOGLE_CLOUD_PROJECT:-""}
 REGION=${REGION:-"us-central1"}
-SERVICE_NAME=${SERVICE_NAME:-"trading-bot"}
+SERVICE_NAME=${SERVICE_NAME:-"spx-straddle-bot"}
 IMAGE_NAME="gcr.io/${PROJECT_ID}/${SERVICE_NAME}"
 MEMORY=${MEMORY:-"1Gi"}
 CPU=${CPU:-"1"}
@@ -23,7 +23,7 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-echo -e "${BLUE}🚀 Trading Bot Cloud Run Deployment${NC}"
+echo -e "${BLUE}🚀 SPX Straddle Bot Cloud Run Deployment${NC}"
 echo "========================================"
 
 # Validate required environment
@@ -100,7 +100,7 @@ gcloud run deploy $SERVICE_NAME \
     --timeout $TIMEOUT \
     --max-instances $MAX_INSTANCES \
     --min-instances $MIN_INSTANCES \
-    --set-env-vars "NODE_ENV=production,RUNNING_IN_CLOUD=true" \
+    --set-env-vars "NODE_ENV=production,RUNNING_IN_CLOUD=true,SPX_SYMBOL=\$SPXW.X,ENTRY_TIME=09:33,TARGET_PROFIT=20,EXIT_TIME=15:50,MAX_POSITION_VALUE=10000,PAPER_TRADING=true" \
     --set-secrets "TRADESTATION_CLIENT_ID=ts_client_id:latest,TRADESTATION_CLIENT_SECRET=ts_client_secret:latest,TRADESTATION_REFRESH_TOKEN=ts_refresh_token:latest" \
     --port 8080
 

@@ -4,18 +4,18 @@
 apiVersion: serving.knative.dev/v1
 kind: Service
 metadata:
-  name: trading-bot
+  name: spx-straddle-bot
   labels:
-    app: trading-bot
+    app: spx-straddle-bot
     environment: production
   annotations:
-    run.googleapis.com/description: "SPX Trading Bot for automated options trading"
+    run.googleapis.com/description: "SPX Straddle Trading Bot for ATM straddle strategy"
     run.googleapis.com/launch-stage: GA
 spec:
   template:
     metadata:
       labels:
-        app: trading-bot
+        app: spx-straddle-bot
         version: v1
       annotations:
         # Scaling configuration
@@ -37,14 +37,14 @@ spec:
         
     spec:
       # Service account for accessing secrets and other GCP services
-      serviceAccountName: trading-bot-service-account
+      serviceAccountName: spx-straddle-bot-service-account
       
       # Request timeout
       timeoutSeconds: 3600
       
       containers:
-      - name: trading-bot
-        image: gcr.io/PROJECT_ID/trading-bot:latest
+      - name: spx-straddle-bot
+        image: gcr.io/PROJECT_ID/spx-straddle-bot:latest
         
         ports:
         - containerPort: 8080
@@ -59,12 +59,18 @@ spec:
           value: "info"
         - name: PAPER_TRADING
           value: "true"
-        - name: MAX_DAILY_LOSS
-          value: "1000"
-        - name: MAX_DRAWDOWN
-          value: "2000"
-        - name: MAX_POSITIONS
-          value: "5"
+        - name: RUNNING_IN_CLOUD
+          value: "true"
+        - name: SPX_SYMBOL
+          value: "$SPXW.X"
+        - name: ENTRY_TIME
+          value: "09:33"
+        - name: TARGET_PROFIT
+          value: "20"
+        - name: EXIT_TIME
+          value: "15:50"
+        - name: MAX_POSITION_VALUE
+          value: "10000"
           
         # Environment variables from Secret Manager
         - name: TRADESTATION_CLIENT_ID
