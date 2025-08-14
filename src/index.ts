@@ -1,19 +1,22 @@
 #!/usr/bin/env node
 
-// Trading Bot - Simplified with Direct Configuration
-// Uses refresh token authentication like the backtest
+// Trading Bot Main Entry Point
+// Supports both local execution and Cloud Run HTTP mode
 
 import 'dotenv/config';
-import { TradingBot, BotConfig } from './bot';
+import { TradingBot, TradingBotConfig } from './trading-bot';
 import { createLogger } from './utils/logger';
 import * as fs from 'fs';
+import express from 'express';
 
-const logger = createLogger('TradingBot', { level: 'info' });
+const logger = createLogger('BotIndex', { level: 'info' });
+const isCloudRun = process.env.RUNNING_IN_CLOUD === 'true';
 
-async function main() {
+async function runLocalBot() {
   try {
-    console.log('🚀 Starting SPX Trading Bot...');
-    console.log('==============================\n');
+    console.log('🤖 SPX Trading Bot');
+    console.log('==================');
+    console.log('Strategy: SPX MACD Momentum with Options Trading\n');
 
     // Validate environment variables
     const requiredEnvVars = ['TRADESTATION_CLIENT_ID', 'TRADESTATION_CLIENT_SECRET', 'TRADESTATION_REFRESH_TOKEN'];
@@ -26,62 +29,30 @@ async function main() {
       process.exit(1);
     }
 
-    // Create simplified bot configuration - ONE PLACE ONLY
-    const config: BotConfig = {
+    // Bot Configuration
+    const config: TradingBotConfig = {
       tradeStation: {
-        baseUrl: 'https://sim-api.tradestation.com/v3',
+        baseUrl: process.env.TRADESTATION_API_URL || 'https://sim-api.tradestation.com/v3',
+        streamingUrl: '',
         clientId: process.env.TRADESTATION_CLIENT_ID!,
         clientSecret: process.env.TRADESTATION_CLIENT_SECRET!,
         redirectUri: '',
-        scope: 'ReadAccount',
-        sandbox: true
+        scope: 'ReadAccount MarketData',
+        sandbox: process.env.TRADESTATION_SANDBOX !== 'false'
       },
-      strategies: [
-        {
-          id: 'spx-backtest-strategy',
-          name: 'SPX Options Backtest Strategy',
-          type: 'SPX_BACKTEST',
-          enabled: true,
-          symbols: ['$SPXW.X'],
-          timeframe: '1min',
-          parameters: {
-            macdFastPeriod: 12,
-            macdSlowPeriod: 26,
-            macdSignalPeriod: 9,
-            macdThreshold: -1.0,
-            profitTarget: 1.0,
-            stopLossPercentage: 0.20
-          },
-          entryConditions: {
-            long: { id: 'entry-long', name: 'Long Entry', operator: 'AND', conditions: [] }
-          },
-          exitConditions: {
-            long: { id: 'exit-long', name: 'Long Exit', operator: 'AND', conditions: [] }
-          },
-          riskManagement: {
-            maxPositionSize: 10000,
-            maxPositionSizeType: 'dollars' as const
-          },
-          positionSizing: {
-            method: 'fixed' as const,
-            baseAmount: 5000
-          },
-          execution: {
-            orderType: 'Market' as const,
-            timeInForce: 'DAY' as const
-          }
-        }
-      ],
-      riskManagement: {
-        maxDailyLoss: parseInt(process.env.MAX_DAILY_LOSS || '1000'),
-        maxDrawdown: parseInt(process.env.MAX_DRAWDOWN || '2000'),
-        maxPositionsPerSymbol: 1,
-        maxTotalPositions: parseInt(process.env.MAX_POSITIONS || '5')
+      strategy: {
+        spxSymbol: '$SPXW.X',
+        macdFastPeriod: 12,
+        macdSlowPeriod: 26,
+        macdSignalPeriod: 9,
+        macdThreshold: -1.0,
+        profitTarget: 100.0,
+        stopLossPercentage: 0.20
       },
-      execution: {
+      trading: {
         paperTrading: process.env.PAPER_TRADING !== 'false',
-        orderTimeout: 30000,
-        maxSlippage: 0.01
+        maxPositions: 1,
+        accountId: process.env.TRADESTATION_ACCOUNT_ID
       },
       logging: {
         level: (process.env.LOG_LEVEL as any) || 'info',
@@ -89,15 +60,15 @@ async function main() {
       }
     };
 
-    console.log('📊 SPX Trading Bot Configuration:');
-    console.log(`   Mode: Testing/Development`);
-    console.log(`   API: ${config.tradeStation.sandbox ? 'Simulation' : 'Production'}`);
-    console.log(`   Trading: ${config.execution.paperTrading ? 'Paper Trading' : 'Live Trading'}`);
-    console.log(`   Strategy: SPX Options (MACD ${config.strategies[0]?.parameters?.macdThreshold || 'N/A'})`);
-    console.log(`   Log Level: ${config.logging.level}`);
+    console.log('📊 Configuration:');
+    console.log(`   API: ${config.tradeStation.sandbox ? 'Sandbox' : 'Production'}`);
+    console.log(`   Paper Trading: ${config.trading.paperTrading ? '✅ YES (SAFE)' : '❌ NO (REAL MONEY)'}`);
+    console.log(`   MACD: ${config.strategy.macdFastPeriod}/${config.strategy.macdSlowPeriod}/${config.strategy.macdSignalPeriod}`);
+    console.log(`   Profit Target: $${config.strategy.profitTarget}`);
+    console.log(`   Stop Loss: ${config.strategy.stopLossPercentage * 100}%`);
     console.log('');
 
-    // Create logs directory if needed
+    // Create logs directory
     const logDir = './logs';
     if (!fs.existsSync(logDir)) {
       fs.mkdirSync(logDir, { recursive: true });
@@ -106,7 +77,7 @@ async function main() {
     // Create bot instance
     const bot = new TradingBot(config);
 
-    // Setup signal handlers for graceful shutdown
+    // Setup signal handlers
     process.on('SIGINT', async () => {
       console.log('\n🛑 Received SIGINT, shutting down gracefully...');
       await bot.stop();
@@ -119,59 +90,36 @@ async function main() {
       process.exit(0);
     });
 
-    // Handle uncaught exceptions
-    process.on('uncaughtException', (error) => {
-      logger.error('Uncaught Exception:', error);
-      console.error('💥 Uncaught Exception:', error.message);
-      process.exit(1);
-    });
-
-    process.on('unhandledRejection', (reason, promise) => {
-      logger.error('Unhandled Rejection:', reason);
-      console.error('💥 Unhandled Rejection:', reason);
-      process.exit(1);
-    });
-
-    // Enhanced event listeners
-    bot.on('started', (state) => {
+    // Event listeners
+    bot.on('started', () => {
       console.log('✅ Trading Bot started successfully!');
-      console.log(`📊 Status: ${state.status}`);
-      console.log(`📈 Accounts: ${state.accounts.length}`);
-      console.log(`🎯 Active Strategies: ${state.activeStrategies.size}`);
-      console.log('\n🔄 Bot is running... Press Ctrl+C to stop.\n');
+      console.log('🔄 Bot is running... Press Ctrl+C to stop.\n');
     });
 
-    bot.on('stopped', (state) => {
+    bot.on('stopped', () => {
       console.log('\n🛑 Trading Bot stopped');
-      console.log(`💰 Total P&L: $${state.totalPnL.toFixed(2)}`);
-      console.log(`📅 Daily P&L: $${state.dailyPnL.toFixed(2)}`);
     });
 
     bot.on('error', (error) => {
-      console.error('❌ Trading Bot error:', error.message);
+      console.error('❌ Trading Bot error:', error instanceof Error ? error.message : String(error));
       logger.error('Bot error:', error);
     });
 
-    bot.on('heartbeat', (state) => {
-      // Only log heartbeat in debug mode
-      if (config.logging.level === 'debug') {
-        console.log(`💓 Heartbeat - Status: ${state.status}, P&L: $${state.totalPnL.toFixed(2)}`);
-      }
+    bot.on('positionOpened', (position) => {
+      console.log(`📈 Position opened: ${position.symbol} @ $${position.entryPrice.toFixed(2)}`);
     });
 
-    bot.on('riskViolation', (violation) => {
-      console.log('⚠️ Risk violation detected:', violation);
-      logger.warn('Risk violation:', violation);
+    bot.on('positionClosed', (position) => {
+      console.log(`📉 Position closed: ${position.symbol} | P&L: $${position.pnl.toFixed(2)}`);
     });
 
     // Start the bot
     await bot.start();
 
-    // Start demo mode if enabled
-    if (process.env.DEMO_MODE === 'true') {
-      console.log('🎭 Starting demo mode with sample SPX data...');
-      startDemoMode(bot);
-    }
+    // Keep the process alive
+    setInterval(() => {
+      // Heartbeat
+    }, 30000);
 
   } catch (error) {
     console.error('💥 Failed to start Trading Bot:', error instanceof Error ? error.message : String(error));
@@ -180,83 +128,227 @@ async function main() {
   }
 }
 
-// Demo mode function to simulate SPX data
-function startDemoMode(bot: TradingBot): void {
-  let currentPrice = 5847.25; // Starting SPX price
-  let bars: any[] = [];
+// Cloud Run HTTP Server Mode
+async function startCloudServer() {
+  const app = express();
+  app.use(express.json());
   
-  // Generate initial bars for MACD calculation
-  for (let i = 0; i < 26; i++) {
-    const price = currentPrice + (Math.random() - 0.5) * 10;
-    const bar = {
-      Open: (currentPrice - 2).toString(),
-      High: (price + 5).toString(),
-      Low: (price - 5).toString(),
-      Close: price.toString(),
-      TimeStamp: new Date(Date.now() - (26 - i) * 60000).toISOString(),
-      TotalVolume: '1250000',
-      Epoch: Date.now() - (26 - i) * 60000,
-      IsRealtime: true,
-      IsEndOfHistory: false,
-      BarStatus: 'Close'
-    };
-    bars.push(bar);
-    currentPrice = price;
-  }
+  let bot: TradingBot | null = null;
+  let botStatus = 'stopped';
+  let statusInterval: NodeJS.Timeout | null = null;
   
-  let barIndex = 0;
-  
-  // Send historical bars first
-  console.log('📊 Loading historical data for MACD calculation...');
-  bars.forEach((bar, index) => {
-    setTimeout(() => {
-      bot.simulateBarData({ symbol: '$SPXW.X', bar });
-    }, index * 100);
+  // Health check endpoint
+  app.get('/health', (req, res) => {
+    res.json({ status: 'healthy', timestamp: new Date().toISOString() });
   });
   
-  // Start live simulation after initial data
-  setTimeout(() => {
-    console.log('🔴 Starting live SPX data simulation...');
-    
-    const interval = setInterval(() => {
-      // Simulate realistic price movement
-      const change = (Math.random() - 0.5) * 5;
-      currentPrice = Math.max(5800, Math.min(5900, currentPrice + change));
+  // Status endpoint - returns detailed status
+  app.get('/status', async (req, res) => {
+    if (bot && botStatus === 'running') {
+      const detailedStatus = await bot.getDetailedStatus();
+      res.json(detailedStatus);
+    } else {
+      res.json({ 
+        status: botStatus, 
+        timestamp: new Date().toISOString(),
+        message: 'Bot not running'
+      });
+    }
+  });
+  
+  // Start bot endpoint
+  app.post('/start', async (req, res) => {
+    try {
+      if (bot && botStatus === 'running') {
+        return res.status(400).json({ error: 'Bot already running' });
+      }
       
-      const bar = {
-        Open: (currentPrice - Math.random() * 3).toString(),
-        High: (currentPrice + Math.random() * 3).toString(),
-        Low: (currentPrice - Math.random() * 3).toString(),
-        Close: currentPrice.toString(),
-        TimeStamp: new Date().toISOString(),
-        TotalVolume: Math.floor(1000000 + Math.random() * 500000).toString(),
-        Epoch: Date.now(),
-        IsRealtime: true,
-        IsEndOfHistory: false,
-        BarStatus: 'Close'
+      // Create config
+      const config: TradingBotConfig = {
+        tradeStation: {
+          baseUrl: process.env.TRADESTATION_API_URL || 'https://sim-api.tradestation.com/v3',
+          streamingUrl: '',
+          clientId: process.env.TRADESTATION_CLIENT_ID!,
+          clientSecret: process.env.TRADESTATION_CLIENT_SECRET!,
+          redirectUri: '',
+          scope: 'ReadAccount MarketData',
+          sandbox: process.env.TRADESTATION_SANDBOX !== 'false'
+        },
+        strategy: {
+          spxSymbol: '$SPXW.X',
+          macdFastPeriod: 12,
+          macdSlowPeriod: 26,
+          macdSignalPeriod: 9,
+          macdThreshold: -1.0,
+          profitTarget: 100.0,
+          stopLossPercentage: 0.20
+        },
+        trading: {
+          paperTrading: process.env.PAPER_TRADING !== 'false',
+          maxPositions: 1,
+          accountId: process.env.TRADESTATION_ACCOUNT_ID
+        },
+        logging: {
+          level: 'info',
+          file: './logs/cloud-bot.log'
+        }
       };
       
-      // Simulate bar update
-      bot.simulateBarData({ symbol: '$SPXW.X', bar });
+      bot = new TradingBot(config);
+      await bot.start();
+      botStatus = 'running';
       
-    }, 3000); // New bar every 3 seconds
-    
-    // Stop after 5 minutes for demo
-    setTimeout(() => {
-      clearInterval(interval);
-      console.log('🎭 Demo mode ended after 5 minutes');
-    }, 300000);
-    
-  }, 3000); // Wait 3 seconds for initial data to load
-}
-
-// Export for testing
-export { main };
-
-// Run if this file is executed directly  
-if (require.main === module) {
-  main().catch((error) => {
-    console.error('💥 Fatal startup error:', error);
-    process.exit(1);
+      // Set up periodic status logging every 10 minutes
+      statusInterval = setInterval(async () => {
+        if (bot && botStatus === 'running') {
+          try {
+            const status = await bot.getDetailedStatus();
+            
+            // Log comprehensive status
+            logger.info('📊 === BOT STATUS UPDATE ===');
+            logger.info(`⏰ Time: ${status.timestamp}`);
+            logger.info(`⏱️  Uptime: ${status.uptime}`);
+            logger.info(`📈 Total Trades Today: ${status.totalTrades}`);
+            logger.info(`💰 Daily P&L: $${status.dailyPnL.toFixed(2)}`);
+            
+            if (status.currentPosition) {
+              logger.info(`🎯 Current Position:`);
+              logger.info(`   ${status.currentPosition.symbol} @ $${status.currentPosition.entryPrice.toFixed(2)}`);
+              logger.info(`   Current: $${status.currentPosition.currentPrice?.toFixed(2) || 'N/A'}`);
+              logger.info(`   Unrealized P&L: $${status.currentPosition.unrealizedPnL?.toFixed(2) || '0.00'}`);
+            } else if (status.activePositions.length > 0) {
+              logger.info(`🎯 Active Positions (${status.activePositions.length}):`);
+              status.activePositions.forEach(pos => {
+                logger.info(`   • ${pos.symbol}: ${pos.quantity} @ ${pos.side} | P&L: $${pos.unrealizedPnL?.toFixed(2) || '0.00'}`);
+              });
+            } else {
+              logger.info('🎯 No active positions');
+            }
+            
+            logger.info('========================');
+            
+            // Also log to console for Cloud Run logs
+            console.log(JSON.stringify({
+              type: 'STATUS_UPDATE',
+              timestamp: status.timestamp,
+              uptime: status.uptime,
+              totalTrades: status.totalTrades,
+              dailyPnL: status.dailyPnL,
+              activePositions: status.activePositions.length,
+              currentPosition: status.currentPosition
+            }));
+            
+          } catch (error) {
+            logger.error('Error getting bot status:', error);
+          }
+        }
+      }, 10 * 60 * 1000); // Every 10 minutes
+      
+      // Log initial status immediately
+      setTimeout(async () => {
+        if (bot && botStatus === 'running') {
+          const status = await bot.getDetailedStatus();
+          logger.info('🚀 Bot started - Initial status:');
+          logger.info(`   Accounts: ${status.accounts}`);
+          logger.info(`   Status: ${status.status}`);
+          console.log(JSON.stringify({
+            type: 'BOT_STARTED',
+            ...status
+          }));
+        }
+      }, 5000); // Wait 5 seconds for initialization
+      
+      // Auto-stop at 4 PM ET
+      const now = new Date();
+      const marketClose = new Date();
+      
+      // Set to 4 PM ET
+      const currentHour = now.getUTCHours();
+      const targetUTCHour = 20; // 4 PM ET is 8 PM UTC (EDT) or 9 PM UTC (EST)
+      
+      marketClose.setUTCHours(targetUTCHour, 0, 0, 0);
+      
+      // If we're past 4 PM ET today, set for tomorrow
+      if (now >= marketClose) {
+        marketClose.setDate(marketClose.getDate() + 1);
+      }
+      
+      const msUntilClose = marketClose.getTime() - now.getTime();
+      const hoursUntilClose = msUntilClose / (1000 * 60 * 60);
+      
+      if (hoursUntilClose > 0 && hoursUntilClose < 12) {
+        logger.info(`Auto-stop scheduled for ${marketClose.toISOString()} (${hoursUntilClose.toFixed(1)} hours)`);
+        setTimeout(async () => {
+          if (bot) {
+            logger.info('Market close - stopping bot');
+            
+            // Clear status logging interval
+            if (statusInterval) {
+              clearInterval(statusInterval);
+              statusInterval = null;
+            }
+            
+            await bot.stop();
+            bot = null;
+            botStatus = 'stopped';
+            logger.info('Bot stopped at market close');
+          }
+        }, msUntilClose);
+      }
+      
+      res.json({ message: 'Bot started successfully' });
+    } catch (error: any) {
+      logger.error('Failed to start bot:', error);
+      res.status(500).json({ error: 'Failed to start bot', details: error.message });
+    }
+  });
+  
+  // Stop bot endpoint
+  app.post('/stop', async (req, res) => {
+    try {
+      if (!bot || botStatus !== 'running') {
+        return res.status(400).json({ error: 'Bot not running' });
+      }
+      
+      // Clear status logging interval
+      if (statusInterval) {
+        clearInterval(statusInterval);
+        statusInterval = null;
+      }
+      
+      await bot.stop();
+      bot = null;
+      botStatus = 'stopped';
+      
+      logger.info('🛑 Bot stopped by user request');
+      res.json({ message: 'Bot stopped successfully' });
+    } catch (error: any) {
+      logger.error('Failed to stop bot:', error);
+      res.status(500).json({ error: 'Failed to stop bot', details: error.message });
+    }
+  });
+  
+  const PORT = process.env.PORT || 8080;
+  app.listen(PORT, () => {
+    console.log(`☁️ Cloud Run server listening on port ${PORT}`);
   });
 }
+
+// Main entry point
+if (require.main === module) {
+  if (isCloudRun) {
+    // Cloud Run mode - start HTTP server
+    startCloudServer().catch((error) => {
+      console.error('💥 Fatal Cloud Run startup error:', error);
+      process.exit(1);
+    });
+  } else {
+    // Local mode - run bot directly
+    runLocalBot().catch((error) => {
+      console.error('💥 Fatal startup error:', error);
+      process.exit(1);
+    });
+  }
+}
+
+export { TradingBot, TradingBotConfig };

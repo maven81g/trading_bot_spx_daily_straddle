@@ -8,7 +8,7 @@
 
 import 'dotenv/config';
 import express from 'express';
-import { TradingBot, BotConfig } from '../dist/bot';
+import { TradingBot, TradingBotConfig } from '../dist/trading-bot';
 import { createLogger } from '../dist/utils/logger';
 
 const logger = createLogger('BotService', { level: 'info' });
@@ -36,7 +36,7 @@ app.use((req, res, next) => {
 /**
  * Create bot configuration (same as main index.ts)
  */
-function createBotConfig(): BotConfig {
+function createBotConfig(): TradingBotConfig {
   // Validate environment variables
   const requiredEnvVars = ['TRADESTATION_CLIENT_ID', 'TRADESTATION_CLIENT_SECRET', 'TRADESTATION_REFRESH_TOKEN'];
   const missing = requiredEnvVars.filter(env => !process.env[env]);
@@ -47,59 +47,27 @@ function createBotConfig(): BotConfig {
 
   return {
     tradeStation: {
-      baseUrl: 'https://sim-api.tradestation.com/v3',
+      baseUrl: process.env.TRADESTATION_API_URL || 'https://sim-api.tradestation.com/v3',
+      streamingUrl: '',
       clientId: process.env.TRADESTATION_CLIENT_ID!,
       clientSecret: process.env.TRADESTATION_CLIENT_SECRET!,
       redirectUri: '',
-      scope: 'ReadAccount',
-      sandbox: true
+      scope: 'ReadAccount MarketData',
+      sandbox: process.env.TRADESTATION_SANDBOX !== 'false'
     },
-    strategies: [
-      {
-        id: 'spx-backtest-strategy',
-        name: 'SPX Options Backtest Strategy',
-        type: 'SPX_BACKTEST',
-        enabled: true,
-        symbols: ['$SPXW.X'],
-        timeframe: '1min',
-        parameters: {
-          macdFastPeriod: 12,
-          macdSlowPeriod: 26,
-          macdSignalPeriod: 9,
-          macdThreshold: -1.0,
-          profitTarget: 1.0,
-          stopLossPercentage: 0.20
-        },
-        entryConditions: {
-          long: { id: 'entry-long', name: 'Long Entry', operator: 'AND', conditions: [] }
-        },
-        exitConditions: {
-          long: { id: 'exit-long', name: 'Long Exit', operator: 'AND', conditions: [] }
-        },
-        riskManagement: {
-          maxPositionSize: 10000,
-          maxPositionSizeType: 'dollars' as const
-        },
-        positionSizing: {
-          method: 'fixed' as const,
-          baseAmount: 5000
-        },
-        execution: {
-          orderType: 'Market' as const,
-          timeInForce: 'DAY' as const
-        }
-      }
-    ],
-    riskManagement: {
-      maxDailyLoss: parseInt(process.env.MAX_DAILY_LOSS || '1000'),
-      maxDrawdown: parseInt(process.env.MAX_DRAWDOWN || '2000'),
-      maxPositionsPerSymbol: 1,
-      maxTotalPositions: parseInt(process.env.MAX_POSITIONS || '5')
+    strategy: {
+      spxSymbol: '$SPXW.X',
+      macdFastPeriod: 12,
+      macdSlowPeriod: 26,
+      macdSignalPeriod: 9,
+      macdThreshold: -1.0,
+      profitTarget: 100.0,
+      stopLossPercentage: 0.20
     },
-    execution: {
+    trading: {
       paperTrading: process.env.PAPER_TRADING !== 'false',
-      orderTimeout: 30000,
-      maxSlippage: 0.01
+      maxPositions: 1,
+      accountId: process.env.TRADESTATION_ACCOUNT_ID
     },
     logging: {
       level: (process.env.LOG_LEVEL as any) || 'info',

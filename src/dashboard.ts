@@ -2,7 +2,7 @@
 // Provides real-time status updates and activity monitoring
 
 import { EventEmitter } from 'events';
-import { SimpleTradingBot } from './simple-trading-bot';
+import { TradingBot } from './trading-bot';
 
 interface DashboardConfig {
   updateInterval: number; // seconds
@@ -11,7 +11,7 @@ interface DashboardConfig {
 }
 
 export class TradingDashboard extends EventEmitter {
-  private bot: SimpleTradingBot;
+  private bot: TradingBot;
   private config: DashboardConfig;
   private updateTimer: NodeJS.Timeout | null = null;
   private isRunning = false;
@@ -32,7 +32,7 @@ export class TradingDashboard extends EventEmitter {
   // Activity log (last 10 activities)
   private activityLog: string[] = [];
 
-  constructor(bot: SimpleTradingBot, config: Partial<DashboardConfig> = {}) {
+  constructor(bot: TradingBot, config: Partial<DashboardConfig> = {}) {
     super();
     this.bot = bot;
     this.config = {
@@ -130,20 +130,21 @@ export class TradingDashboard extends EventEmitter {
       console.clear();
     }
     
-    const status = this.bot.getStatus();
+    const status = this.bot.getRunningStatus();
     const uptime = Math.floor((new Date().getTime() - this.startTime.getTime()) / 1000);
     const uptimeStr = this.formatUptime(uptime);
     
     console.log('╔══════════════════════════════════════════════════════════════╗');
     console.log('║                    📊 SPX TRADING BOT DASHBOARD              ║');
     console.log('╠══════════════════════════════════════════════════════════════╣');
-    console.log(`║ Status: ${status.isRunning ? '🟢 RUNNING' : '🔴 STOPPED'}     │ Uptime: ${uptimeStr.padEnd(20)}║`);
-    console.log(`║ Data: ${status.spxBarsCount.toString().padEnd(6)} SPX bars│ MACD History: ${status.macdHistoryLength.toString().padEnd(12)}║`);
+    console.log(`║ Status: ${status ? '🟢 RUNNING' : '🔴 STOPPED'}     │ Uptime: ${uptimeStr.padEnd(20)}║`);
+    console.log(`║ Trades: ${this.bot.getTotalTrades().toString().padEnd(6)} │ Daily P&L: $${this.bot.getDailyPnL().toFixed(2).padEnd(12)}║`);
     console.log('╠══════════════════════════════════════════════════════════════╣');
     
     // Current Position
-    if (status.currentPosition) {
-      const pos = status.currentPosition;
+    const currentPosition = this.bot.getCurrentPosition();
+    if (currentPosition) {
+      const pos = currentPosition;
       const pnl = pos.unrealizedPnL || 0;
       const pnlStr = pnl >= 0 ? `+$${pnl.toFixed(2)}` : `-$${Math.abs(pnl).toFixed(2)}`;
       const holdTime = Math.floor((new Date().getTime() - pos.entryTime.getTime()) / 60000);

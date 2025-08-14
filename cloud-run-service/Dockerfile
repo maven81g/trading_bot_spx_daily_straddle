@@ -64,4 +64,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
 ENTRYPOINT ["dumb-init", "--"]
 
 # Start the main app with Cloud Run mode enabled
-CMD ["node", "dist/simple-index.js"]
+CMD ["node", "dist/index.js"]

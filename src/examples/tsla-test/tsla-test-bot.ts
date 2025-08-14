@@ -3,12 +3,12 @@
 
 import { EventEmitter } from 'events';
 import { Logger } from 'winston';
-import { TradeStationClient } from './api/client';
-import { createLogger } from './utils/logger';
+import { TradeStationClient } from '../../api/client';
+import { createLogger } from '../../utils/logger';
 import {
   TradeStationConfig,
   Account
-} from './types/tradestation';
+} from '../../types/tradestation';
 
 interface TSLATestBotConfig {
   tradeStation: TradeStationConfig;

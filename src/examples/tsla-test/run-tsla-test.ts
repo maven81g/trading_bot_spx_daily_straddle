@@ -5,7 +5,7 @@
 
 import 'dotenv/config';
 import { TSLATestBot } from './tsla-test-bot';
-import { createLogger } from './utils/logger';
+import { createLogger } from '../../utils/logger';
 import * as fs from 'fs';
 
 const logger = createLogger('TSLATestRunner', { level: 'info' });

@@ -3,15 +3,15 @@
 
 import { EventEmitter } from 'events';
 import { Logger } from 'winston';
-import { TradeStationClient } from './api/client';
-import { TradeStationHttpStreaming } from './api/http-streaming';
-import { createLogger } from './utils/logger';
+import { TradeStationClient } from '../../api/client';
+import { TradeStationHttpStreaming } from '../../api/http-streaming';
+import { createLogger } from '../../utils/logger';
 import {
   TradeStationConfig,
   Account,
   Bar,
   Quote
-} from './types/tradestation';
+} from '../../types/tradestation';
 
 export interface HttpTestBotConfig {
   tradeStation: TradeStationConfig;
