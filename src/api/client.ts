@@ -270,7 +270,16 @@ export class TradeStationClient extends EventEmitter {
   async getQuote(symbol: string): Promise<ApiResponse<Quote>> {
     try {
       const response = await this.httpClient.get(`/marketdata/quotes/${symbol}`);
-      return { success: true, data: response.data };
+      // TradeStation returns Quotes array, extract first quote
+      const quotes = response.data.Quotes || response.data;
+      const quote = Array.isArray(quotes) ? quotes[0] : quotes;
+      
+      if (!quote) {
+        this.logger.error(`No quote data returned for symbol: ${symbol}`);
+        return { success: false, error: 'No quote data available' };
+      }
+      
+      return { success: true, data: quote };
     } catch (error) {
       this.logger.error('Error fetching quote:', error);
       return { success: false, error: error.message };
@@ -284,19 +293,33 @@ export class TradeStationClient extends EventEmitter {
       this.logger.info(`Placing order to endpoint: ${endpoint}`, { order });
       
       const response = await this.httpClient.post(endpoint, order);
+      this.logger.info(`Order placed successfully:`, response.data);
       return { success: true, data: response.data };
     } catch (error) {
-      this.logger.error('Error placing order:', error);
-      
-      // Extract TradeStation API error details
+      // Extract detailed error information
       if (error && typeof error === 'object' && 'response' in error) {
         const axiosError = error as any;
+        const statusCode = axiosError.response?.status;
+        const statusText = axiosError.response?.statusText;
         const apiError = axiosError.response?.data;
-        if (apiError) {
-          return { success: false, error: axiosError.message, data: apiError };
-        }
+        
+        this.logger.error(`Order placement failed - Status: ${statusCode} ${statusText}`, {
+          endpoint: `/orderexecution/orders`,
+          order: order,
+          errorResponse: apiError,
+          errorMessage: axiosError.message,
+          fullError: {
+            status: statusCode,
+            statusText: statusText,
+            data: apiError,
+            headers: axiosError.response?.headers
+          }
+        });
+        
+        return { success: false, error: `${statusCode}: ${JSON.stringify(apiError)}`, data: apiError };
       }
       
+      this.logger.error('Error placing order (non-API error):', error);
       return { success: false, error: error.message };
     }
   }

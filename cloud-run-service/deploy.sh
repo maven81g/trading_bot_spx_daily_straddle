@@ -100,7 +100,7 @@ gcloud run deploy $SERVICE_NAME \
     --timeout $TIMEOUT \
     --max-instances $MAX_INSTANCES \
     --min-instances $MIN_INSTANCES \
-    --set-env-vars "NODE_ENV=production,RUNNING_IN_CLOUD=true,SPX_SYMBOL=\$SPXW.X,ENTRY_TIME=09:33,TARGET_PROFIT=20,EXIT_TIME=15:50,MAX_POSITION_VALUE=10000,PAPER_TRADING=true" \
+    --set-env-vars "NODE_ENV=production,RUNNING_IN_CLOUD=true,SPX_SYMBOL=\$SPXW.X,ENTRY_TIME=09:33,TARGET_PROFIT=20,EXIT_TIME=15:50,MAX_POSITION_VALUE=10000,PAPER_TRADING=true,LOG_LEVEL=debug" \
     --set-secrets "TRADESTATION_CLIENT_ID=ts_client_id:latest,TRADESTATION_CLIENT_SECRET=ts_client_secret:latest,TRADESTATION_REFRESH_TOKEN=ts_refresh_token:latest" \
     --port 8080
 

@@ -6,6 +6,7 @@ import { Logger } from 'winston';
 import { TradeStationClient } from './api/client';
 import { TradeStationHttpStreaming } from './api/http-streaming';
 import { createLogger } from './utils/logger';
+import { HeartbeatMonitor } from './utils/heartbeat-monitor';
 import { BigQuery } from '@google-cloud/bigquery';
 import {
   TradeStationConfig,
@@ -13,6 +14,7 @@ import {
   Position,
   Bar,
   Quote,
+  Order,
   OrderRequest,
   OrderResponse
 } from './types/tradestation';
@@ -39,6 +41,12 @@ export interface StraddleBotConfig {
   bigquery?: {
     projectId: string;
     datasetId: string;
+  };
+  heartbeat?: {
+    enabled: boolean;
+    intervalMs?: number;
+    webhookUrl?: string;
+    logPath?: string;
   };
 }
 
@@ -71,6 +79,7 @@ export class SPXStraddleBot extends EventEmitter {
   private apiClient: TradeStationClient;
   private streamingClient: TradeStationHttpStreaming;
   private bigquery?: BigQuery;
+  private heartbeatMonitor?: HeartbeatMonitor;
   private accounts: Account[] = [];
   private isRunning = false;
   private startTime: Date | null = null;
@@ -97,6 +106,8 @@ export class SPXStraddleBot extends EventEmitter {
   // Timing
   private entryCheckInterval: NodeJS.Timeout | null = null;
   private positionMonitorInterval: NodeJS.Timeout | null = null;
+  private heartbeatInterval: NodeJS.Timeout | null = null;
+  private lastDataReceived: Date = new Date();
 
   constructor(config: StraddleBotConfig) {
     super();
@@ -109,6 +120,21 @@ export class SPXStraddleBot extends EventEmitter {
     if (config.bigquery) {
       this.bigquery = new BigQuery({
         projectId: config.bigquery.projectId
+      });
+    }
+    
+    // Setup heartbeat monitor if configured
+    if (config.heartbeat?.enabled) {
+      this.heartbeatMonitor = new HeartbeatMonitor({
+        intervalMs: config.heartbeat.intervalMs || 60000, // Default 1 minute
+        webhookUrl: config.heartbeat.webhookUrl,
+        fileLogPath: config.heartbeat.logPath || './logs/heartbeat.log',
+        alertAfterMissedBeats: 3
+      }, this.logger);
+      
+      this.heartbeatMonitor.on('alert', (message: string) => {
+        this.logger.error(`Heartbeat Alert: ${message}`);
+        this.emit('heartbeatAlert', message);
       });
     }
     
@@ -211,6 +237,35 @@ export class SPXStraddleBot extends EventEmitter {
         this.monitorPosition();
       }, 30000);
       
+      // Set up data stream heartbeat monitor (runs every 60 seconds)
+      this.logger.info('Setting up data stream monitor (60s intervals)');
+      this.heartbeatInterval = setInterval(() => {
+        this.checkHeartbeat();
+      }, 60000);
+      
+      // Run initial heartbeat check after 10 seconds
+      setTimeout(() => {
+        this.logger.info('Running initial data stream check...');
+        this.checkHeartbeat();
+      }, 10000);
+      
+      // Start the system heartbeat monitor if configured
+      if (this.heartbeatMonitor) {
+        this.heartbeatMonitor.start(async () => {
+          // Provide bot status for heartbeat
+          return {
+            isRunning: this.isRunning,
+            spxPrice: this.currentSPXPrice,
+            hasPosition: this.currentStraddle?.isOpen || false,
+            dailyPnL: this.dailyPnL,
+            totalTrades: this.totalTrades,
+            lastDataReceived: this.lastDataReceived.toISOString(),
+            dataStreamStatus: this.getDataStreamStatus()
+          };
+        });
+        this.logger.info('System heartbeat monitor started');
+      }
+      
       this.isRunning = true;
       this.emit('started');
       
@@ -241,6 +296,16 @@ export class SPXStraddleBot extends EventEmitter {
     if (this.positionMonitorInterval) {
       clearInterval(this.positionMonitorInterval);
       this.positionMonitorInterval = null;
+    }
+    
+    if (this.heartbeatInterval) {
+      clearInterval(this.heartbeatInterval);
+      this.heartbeatInterval = null;
+    }
+    
+    // Stop heartbeat monitor
+    if (this.heartbeatMonitor) {
+      this.heartbeatMonitor.stop();
     }
     
     // Close any open positions
@@ -279,13 +344,15 @@ export class SPXStraddleBot extends EventEmitter {
   }
 
   private setupEntryTimeChecker(): void {
-    // Check every minute if it's time to enter
+    // Check every 30 seconds for better accuracy
     this.entryCheckInterval = setInterval(() => {
       this.checkEntryTime();
-    }, 60000); // Every minute
+    }, 30000); // Every 30 seconds
     
-    // Also check immediately
-    this.checkEntryTime();
+    // Wait a bit for SPX price to arrive, then check
+    setTimeout(() => {
+      this.checkEntryTime();
+    }, 5000); // Check after 5 seconds (enough time for first SPX bar)
   }
 
   private checkEntryTime(): void {
@@ -301,9 +368,19 @@ export class SPXStraddleBot extends EventEmitter {
     const currentHour = etNow.getHours();
     const currentMinute = etNow.getMinutes();
     
+    // Log current check status
+    this.logger.debug(`Entry check: ${currentHour}:${String(currentMinute).padStart(2, '0')} ET | Target: ${entryHour}:${String(entryMinute).padStart(2, '0')} | SPX: $${this.currentSPXPrice.toFixed(2)}`);
+    
     // Check if it's within 2 minutes of entry time
     if (currentHour === entryHour && Math.abs(currentMinute - entryMinute) <= 2) {
-      this.logger.info(`Entry time reached at ${etNow.toLocaleTimeString('en-US', {timeZone: 'America/New_York'})}`);
+      this.logger.info(`🎯 Entry time reached at ${etNow.toLocaleTimeString('en-US', {timeZone: 'America/New_York'})}`);
+      
+      // Make sure we have SPX price
+      if (!this.currentSPXPrice || this.currentSPXPrice === 0) {
+        this.logger.warn(`⚠️ Entry time reached but no SPX price yet. Waiting for price data...`);
+        return;
+      }
+      
       this.enterStraddle();
     }
   }
@@ -322,11 +399,14 @@ export class SPXStraddleBot extends EventEmitter {
       
       // Get expiration date (0DTE for today)
       const expDate = new Date();
-      const expDateStr = expDate.toISOString().split('T')[0].replace(/-/g, '');
+      const year = expDate.getFullYear().toString().slice(-2); // Get last 2 digits of year
+      const month = (expDate.getMonth() + 1).toString().padStart(2, '0');
+      const day = expDate.getDate().toString().padStart(2, '0');
+      const expDateStr = `${year}${month}${day}`; // Format: YYMMDD
       
-      // Build option symbols (format: SPXW YYMMDD C/P STRIKE)
-      const callSymbol = `SPXW ${expDateStr} C ${strike}`;
-      const putSymbol = `SPXW ${expDateStr} P ${strike}`;
+      // Build option symbols (format: SPXW YYMMDDCSTRIKE, e.g., SPXW 250814C6440)
+      const callSymbol = `SPXW ${expDateStr}C${strike}`;
+      const putSymbol = `SPXW ${expDateStr}P${strike}`;
       
       this.logger.info(`Strike selected: ${strike}`);
       this.logger.info(`Call symbol: ${callSymbol}`);
@@ -338,13 +418,23 @@ export class SPXStraddleBot extends EventEmitter {
         this.apiClient.getQuote(putSymbol)
       ]);
       
+      // Log the raw responses for debugging
+      this.logger.debug(`Call quote response:`, callQuoteResponse);
+      this.logger.debug(`Put quote response:`, putQuoteResponse);
+      
       if (!callQuoteResponse.success || !putQuoteResponse.success) {
         this.logger.error('Failed to get option quotes');
+        this.logger.error(`Call response success: ${callQuoteResponse.success}, data: ${JSON.stringify(callQuoteResponse.data)}`);
+        this.logger.error(`Put response success: ${putQuoteResponse.success}, data: ${JSON.stringify(putQuoteResponse.data)}`);
         return;
       }
       
       const callQuote = callQuoteResponse.data;
       const putQuote = putQuoteResponse.data;
+      
+      // Log the quote details
+      this.logger.info(`Call quote - Symbol: ${callSymbol}, Bid: ${callQuote.Bid}, Ask: ${callQuote.Ask}, Last: ${callQuote.Last}`);
+      this.logger.info(`Put quote - Symbol: ${putSymbol}, Bid: ${putQuote.Bid}, Ask: ${putQuote.Ask}, Last: ${putQuote.Last}`);
       const callPrice = Number(callQuote.Ask || callQuote.Last || 0);
       const putPrice = Number(putQuote.Ask || putQuote.Last || 0);
       const totalPrice = callPrice + putPrice;
@@ -398,24 +488,29 @@ export class SPXStraddleBot extends EventEmitter {
       // Place orders if not paper trading
       if (!this.config.trading.paperTrading) {
         await this.placeStraddleOrders();
-      } else {
         this.logger.info('PAPER TRADE: Straddle entered (no real orders placed)');
+      } else {
+        // For paper trading, emit success immediately
+        this.totalTrades++;
+        this.emit('straddleOpened', this.currentStraddle);
       }
       
       // Subscribe to option quotes for monitoring
       await this.subscribeToOptions(callSymbol, putSymbol);
       
-      this.totalTrades++;
-      this.emit('straddleOpened', this.currentStraddle);
-      
     } catch (error) {
       this.logger.error('Failed to enter straddle:', error);
+      // Clear position if straddle creation failed
+      this.currentStraddle = null;
       this.emit('error', error);
     }
   }
 
   private async placeStraddleOrders(): Promise<void> {
     if (!this.currentStraddle) return;
+    
+    let callOrderId: string | null = null;
+    let putOrderId: string | null = null;
     
     try {
       const accountId = this.config.trading.accountId || this.accounts[0].AccountID;
@@ -426,7 +521,7 @@ export class SPXStraddleBot extends EventEmitter {
         Symbol: this.currentStraddle.callSymbol,
         Quantity: this.currentStraddle.quantity.toString(),
         OrderType: 'Market',
-        TradeAction: 'BUY',
+        TradeAction: 'BUYTOOPEN',
         TimeInForce: { Duration: 'DAY' },
         Route: 'Intelligent'
       };
@@ -437,7 +532,7 @@ export class SPXStraddleBot extends EventEmitter {
         Symbol: this.currentStraddle.putSymbol,
         Quantity: this.currentStraddle.quantity.toString(),
         OrderType: 'Market',
-        TradeAction: 'BUY',
+        TradeAction: 'BUYTOOPEN',
         TimeInForce: { Duration: 'DAY' },
         Route: 'Intelligent'
       };
@@ -447,17 +542,126 @@ export class SPXStraddleBot extends EventEmitter {
         this.apiClient.placeOrder(putOrder)
       ]);
       
+      // Track successful orders for potential rollback
+      if (callResponse.success) {
+        callOrderId = callResponse.data.OrderID;
+        this.logger.info(`Call order placed: ${callOrderId}`);
+      }
+      if (putResponse.success) {
+        putOrderId = putResponse.data.OrderID;
+        this.logger.info(`Put order placed: ${putOrderId}`);
+      }
+      
+      // Both orders must succeed
       if (callResponse.success && putResponse.success) {
-        this.currentStraddle.callOrderId = callResponse.data.OrderID;
-        this.currentStraddle.putOrderId = putResponse.data.OrderID;
+        this.currentStraddle.callOrderId = callOrderId!;
+        this.currentStraddle.putOrderId = putOrderId!;
         
-        this.logger.info(`Orders placed - Call: ${callResponse.data.OrderID}, Put: ${putResponse.data.OrderID}`);
+        this.logger.info(`✅ Both orders successful - Call: ${callOrderId}, Put: ${putOrderId}`);
+        
+        // Only now emit success and increment trade count
+        this.totalTrades++;
+        this.emit('straddleOpened', this.currentStraddle);
+        
       } else {
-        throw new Error('Failed to place orders');
+        // Rollback: Cancel or close any successful order
+        if (callOrderId) {
+          this.logger.warn(`❌ Put order failed, handling successful call order: ${callOrderId}`);
+          await this.cancelOrCloseOrder(callOrderId, this.currentStraddle.callSymbol, this.currentStraddle.quantity);
+        }
+        if (putOrderId) {
+          this.logger.warn(`❌ Call order failed, handling successful put order: ${putOrderId}`);
+          await this.cancelOrCloseOrder(putOrderId, this.currentStraddle.putSymbol, this.currentStraddle.quantity);
+        }
+        
+        // Clear the position since orders failed
+        this.currentStraddle = null;
+        
+        throw new Error(`Orders failed - Call: ${callResponse.success ? 'OK' : 'FAILED'}, Put: ${putResponse.success ? 'OK' : 'FAILED'}`);
       }
       
     } catch (error) {
-      this.logger.error('Failed to place orders:', error);
+      this.logger.error('Failed to place straddle orders:', error);
+      
+      // Rollback any successful orders on exception
+      if (callOrderId && this.currentStraddle) {
+        this.logger.warn(`Exception occurred, handling call order: ${callOrderId}`);
+        try { await this.cancelOrCloseOrder(callOrderId, this.currentStraddle.callSymbol, this.currentStraddle.quantity); } catch (e) { this.logger.error('Failed to handle call order:', e); }
+      }
+      if (putOrderId && this.currentStraddle) {
+        this.logger.warn(`Exception occurred, handling put order: ${putOrderId}`);
+        try { await this.cancelOrCloseOrder(putOrderId, this.currentStraddle.putSymbol, this.currentStraddle.quantity); } catch (e) { this.logger.error('Failed to handle put order:', e); }
+      }
+      
+      // Clear the position since orders failed
+      this.currentStraddle = null;
+      throw error;
+    }
+  }
+
+  private async cancelOrCloseOrder(orderId: string, symbol: string, quantity: number): Promise<void> {
+    try {
+      // First, try to cancel the order (in case it's still pending)
+      this.logger.info(`🔄 Attempting to cancel order: ${orderId}`);
+      const cancelResponse = await this.apiClient.cancelOrder(orderId);
+      
+      if (cancelResponse.success) {
+        this.logger.info(`✅ Order cancelled: ${orderId}`);
+        return;
+      }
+      
+      // If cancel failed, check if order was already filled
+      this.logger.warn(`❌ Cancel failed for ${orderId}: ${cancelResponse.error}`);
+      this.logger.info(`🔍 Checking order status to determine if filled...`);
+      
+      // Get order status
+      const accountId = this.config.trading.accountId || this.accounts[0]?.AccountID;
+      if (!accountId) {
+        throw new Error('No account ID available for order status check');
+      }
+      
+      const ordersResponse = await this.apiClient.getOrders(accountId);
+      if (!ordersResponse.success) {
+        throw new Error(`Failed to get orders: ${ordersResponse.error}`);
+      }
+      
+      const order = ordersResponse.data.find(o => o.OrderID === orderId);
+      if (!order) {
+        this.logger.warn(`⚠️ Order ${orderId} not found in account orders - may have been cancelled or expired`);
+        return;
+      }
+      
+      this.logger.info(`📋 Order ${orderId} status: ${order.Status} (${order.StatusDescription})`);
+      
+      // Check if order was filled/executed
+      const filledStatuses = ['Filled', 'Partially Filled', 'Executed'];
+      if (filledStatuses.some(status => order.Status.includes(status))) {
+        this.logger.warn(`⚠️ Order ${orderId} already filled - placing sell order to close position`);
+        
+        // Place sell order to close the filled position
+        const sellOrder: OrderRequest = {
+          AccountID: accountId,
+          Symbol: symbol,
+          Quantity: quantity.toString(),
+          OrderType: 'Market',
+          TradeAction: 'SELLTOCLOSE',
+          TimeInForce: { Duration: 'DAY' },
+          Route: 'Intelligent'
+        };
+        
+        const sellResponse = await this.apiClient.placeOrder(sellOrder);
+        if (sellResponse.success) {
+          this.logger.info(`✅ Sell order placed to close position: ${sellResponse.data.OrderID}`);
+        } else {
+          this.logger.error(`❌ Failed to place sell order: ${sellResponse.error}`);
+          throw new Error(`Failed to close filled position for ${symbol}`);
+        }
+      } else {
+        this.logger.warn(`⚠️ Order ${orderId} status '${order.Status}' - no action needed`);
+      }
+      
+    } catch (error) {
+      this.logger.error(`❌ Exception handling order ${orderId}:`, error);
       throw error;
     }
   }
@@ -499,19 +703,94 @@ export class SPXStraddleBot extends EventEmitter {
       const bar = data.bar;
       const timestamp = bar.TimeStamp || bar.Timestamp;
       
+      // Update last data received time
+      this.lastDataReceived = new Date();
+      
       // Only update if this is a new bar (avoid duplicate ticks)
       if (!this.lastBarTimestamp || timestamp !== this.lastBarTimestamp) {
         this.currentSPXPrice = Number(bar.Close);
         this.lastBarTimestamp = timestamp;
         
-        this.logger.debug(`📊 SPX Bar: ${timestamp} = $${this.currentSPXPrice.toFixed(2)} (O:${bar.Open} H:${bar.High} L:${bar.Low})`);
+        // Always log bar updates at info level during market hours for visibility
+        const now = new Date();
+        const etNow = new Date(now.toLocaleString("en-US", {timeZone: "America/New_York"}));
+        const hour = etNow.getHours();
+        if (hour >= 9 && hour < 16) {
+          this.logger.info(`📊 SPX Bar: ${timestamp} = $${this.currentSPXPrice.toFixed(2)} (O:${bar.Open} H:${bar.High} L:${bar.Low})`);
+        } else {
+          this.logger.debug(`📊 SPX Bar: ${timestamp} = $${this.currentSPXPrice.toFixed(2)} (O:${bar.Open} H:${bar.High} L:${bar.Low})`);
+        }
         
         // Log significant price moves
         const priceChange = Math.abs(this.currentSPXPrice - Number(bar.Open));
         if (priceChange > 5) {
           this.logger.info(`📊 Significant SPX move: $${priceChange.toFixed(2)} in 1 minute to $${this.currentSPXPrice.toFixed(2)}`);
         }
+      } else {
+        // Log duplicate bars to detect if stream is stuck
+        this.logger.debug(`📊 Duplicate bar timestamp: ${timestamp}`);
       }
+    }
+  }
+
+  private getDataStreamStatus(): 'healthy' | 'warning' | 'critical' {
+    const now = new Date();
+    const timeSinceLastData = now.getTime() - this.lastDataReceived.getTime();
+    
+    // Check if we're during market hours
+    const etNow = new Date(now.toLocaleString("en-US", {timeZone: "America/New_York"}));
+    const hour = etNow.getHours();
+    const minute = etNow.getMinutes();
+    const isMarketHours = (hour === 9 && minute >= 30) || (hour > 9 && hour < 16);
+    
+    if (isMarketHours) {
+      if (timeSinceLastData > 120000) return 'critical'; // 2+ minutes
+      if (timeSinceLastData > 90000) return 'warning'; // 1.5+ minutes
+    }
+    return 'healthy';
+  }
+
+  private checkHeartbeat(): void {
+    const now = new Date();
+    const timeSinceLastData = now.getTime() - this.lastDataReceived.getTime();
+    const maxSilentTime = 90000; // 1.5 minutes (SPX bars should come every minute)
+    
+    // Check if we're during market hours
+    const etNow = new Date(now.toLocaleString("en-US", {timeZone: "America/New_York"}));
+    const hour = etNow.getHours();
+    const minute = etNow.getMinutes();
+    const isMarketHours = (hour === 9 && minute >= 30) || (hour > 9 && hour < 16);
+    
+    // Always log data stream status at info level for visibility
+    this.logger.info(`📊 Data stream check - Last data: ${Math.round(timeSinceLastData / 1000)}s ago | Last bar: ${this.lastBarTimestamp || 'None'} | SPX: $${this.currentSPXPrice.toFixed(2)}`);
+    
+    // During market hours, be more aggressive about reconnection
+    const reconnectThreshold = isMarketHours ? 90000 : maxSilentTime;
+    
+    if (timeSinceLastData > reconnectThreshold) {
+      this.logger.warn(`⚠️ No data received for ${Math.round(timeSinceLastData / 1000)} seconds - Stream may be dead`);
+      
+      // Emit critical event if heartbeat monitor is active
+      if (this.heartbeatMonitor) {
+        this.emit('dataStreamIssue', {
+          timeSinceLastData,
+          status: 'critical'
+        });
+      }
+      
+      // Force reconnection by unsubscribing first
+      this.logger.info('Force reconnecting SPX stream...');
+      if (this.spxSubscriptionId) {
+        this.streamingClient.unsubscribe(this.spxSubscriptionId);
+        this.spxSubscriptionId = null;
+      }
+      
+      // Wait a second then resubscribe
+      setTimeout(() => {
+        this.subscribeToSPX().catch(error => {
+          this.logger.error('Failed to reconnect SPX stream:', error);
+        });
+      }, 1000);
     }
   }
 
@@ -626,7 +905,7 @@ export class SPXStraddleBot extends EventEmitter {
         Symbol: this.currentStraddle.callSymbol,
         Quantity: this.currentStraddle.quantity.toString(),
         OrderType: 'Market',
-        TradeAction: 'SELL',
+        TradeAction: 'SELLTOCLOSE',
         TimeInForce: { Duration: 'DAY' },
         Route: 'Intelligent'
       };
@@ -637,7 +916,7 @@ export class SPXStraddleBot extends EventEmitter {
         Symbol: this.currentStraddle.putSymbol,
         Quantity: this.currentStraddle.quantity.toString(),
         OrderType: 'Market',
-        TradeAction: 'SELL',
+        TradeAction: 'SELLTOCLOSE',
         TimeInForce: { Duration: 'DAY' },
         Route: 'Intelligent'
       };
@@ -757,7 +1036,8 @@ export class SPXStraddleBot extends EventEmitter {
         targetProfit: this.config.strategy.targetProfitPercent,
         stopLoss: this.config.strategy.stopLossPercent,
         paperTrading: this.config.trading.paperTrading
-      }
+      },
+      heartbeat: this.heartbeatMonitor ? this.heartbeatMonitor.getHeartbeatStatus() : null
     };
   }
 }

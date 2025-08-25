@@ -18,6 +18,8 @@ export interface StreamingSubscription {
   symbols: string[];
   active: boolean;
   abortController?: AbortController;
+  parameters?: any; // Store original subscription parameters for reconnection
+  lastActivity?: number; // Track last activity timestamp
 }
 
 export class TradeStationHttpStreaming extends EventEmitter {
@@ -51,8 +53,9 @@ export class TradeStationHttpStreaming extends EventEmitter {
 
     this.logger.info(`📊 Starting HTTP streaming for bars: ${params.symbol}`);
 
-    // Build streaming URL - HTTP streaming endpoint
-    const streamUrl = `${this.config.baseUrl}/marketdata/stream/barcharts/${params.symbol}?interval=${params.interval}&unit=${params.unit.toLowerCase()}`;
+    // Build streaming URL - HTTP streaming endpoint (URL encode symbol)
+    const encodedSymbol = encodeURIComponent(params.symbol);
+    const streamUrl = `${this.config.baseUrl}/marketdata/stream/barcharts/${encodedSymbol}?interval=${params.interval}&unit=${params.unit.toLowerCase()}`;
     
     const abortController = new AbortController();
     
@@ -61,7 +64,8 @@ export class TradeStationHttpStreaming extends EventEmitter {
       type: 'bars',
       symbols: [params.symbol],
       active: true,
-      abortController
+      abortController,
+      parameters: params
     };
 
     this.subscriptions.set(subscriptionId, subscription);
@@ -102,9 +106,10 @@ export class TradeStationHttpStreaming extends EventEmitter {
 
     this.logger.info(`📈 Starting HTTP streaming for quotes: ${symbols.join(', ')}`);
 
-    // Build streaming URL for quotes - multiple symbols
-    const symbolString = symbols.join(',');
-    const streamUrl = `${this.config.baseUrl}/marketdata/stream/quote/changes/${symbolString}`;
+    // Build streaming URL for quotes - multiple symbols (URL encode each symbol)
+    const encodedSymbols = symbols.map(symbol => encodeURIComponent(symbol));
+    const symbolString = encodedSymbols.join(',');
+    const streamUrl = `${this.config.baseUrl}/marketdata/stream/quotes/${symbolString}`;
     
     const abortController = new AbortController();
     
@@ -113,7 +118,8 @@ export class TradeStationHttpStreaming extends EventEmitter {
       type: 'quotes',
       symbols: symbols,
       active: true,
-      abortController
+      abortController,
+      parameters: { symbols }
     };
 
     this.subscriptions.set(id, subscription);
@@ -144,82 +150,97 @@ export class TradeStationHttpStreaming extends EventEmitter {
     return id;
   }
 
-  // Process HTTP streaming response
+  // Process HTTP streaming response using TradeStation engineer's pattern
   private processHttpStream(response: AxiosResponse, subscriptionId: string, type: 'bars' | 'quotes'): void {
     let buffer = '';
     
     response.data.on('data', (chunk: Buffer) => {
-      buffer += chunk.toString();
-      
-      // Process complete JSON objects
-      this.processBuffer(buffer, subscriptionId, type);
-      
-      // Keep only incomplete data in buffer
-      const lastNewline = buffer.lastIndexOf('\n');
-      if (lastNewline > -1) {
-        buffer = buffer.substring(lastNewline + 1);
+      try {
+        buffer += chunk.toString();
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || ''; // Keep incomplete line in buffer
+        
+        for (const line of lines) {
+          if (!line.trim()) continue; // Skip empty lines
+          
+          try {
+            const json = JSON.parse(line);
+            
+            // Handle heartbeat messages
+            if ('Heartbeat' in json) {
+              this.logger.debug(`💓 Stream heartbeat: ${subscriptionId}`);
+              // Update subscription activity
+              const subscription = this.subscriptions.get(subscriptionId);
+              if (subscription) {
+                subscription.lastActivity = Date.now();
+              }
+              continue;
+            }
+            
+            // Handle error messages
+            if (json.Error) {
+              this.logger.error(`📊 Stream error for ${subscriptionId}: ${json.Error}`);
+              this.emit('error', { subscriptionId, error: json.Error });
+              continue;
+            }
+            
+            // Handle data messages
+            if (type === 'bars' && 'TimeStamp' in json) {
+              // Update subscription activity
+              const subscription = this.subscriptions.get(subscriptionId);
+              if (subscription) {
+                subscription.lastActivity = Date.now();
+              }
+              this.emit('bar', {
+                subscriptionId,
+                symbol: json.Symbol || this.subscriptions.get(subscriptionId)?.symbols[0],
+                bar: json
+              });
+            } else if (type === 'quotes' && 'Symbol' in json) {
+              // Update subscription activity
+              const subscription = this.subscriptions.get(subscriptionId);
+              if (subscription) {
+                subscription.lastActivity = Date.now();
+              }
+              this.emit('quote', {
+                subscriptionId,
+                symbol: json.Symbol,
+                quote: json
+              });
+            }
+            
+          } catch (parseError) {
+            this.logger.debug(`Skipping invalid JSON: ${line.substring(0, 50)}...`);
+          }
+        }
+      } catch (error) {
+        this.logger.error(`Error processing stream data for ${subscriptionId}:`, error);
       }
     });
 
     response.data.on('end', () => {
-      this.logger.info(`📊 HTTP stream ended: ${subscriptionId}`);
+      this.logger.warn(`📊 HTTP stream ended unexpectedly: ${subscriptionId}`);
       this.handleStreamEnd(subscriptionId);
+      // Attempt to reconnect after 5 seconds
+      setTimeout(() => {
+        this.logger.info(`Attempting to reconnect stream: ${subscriptionId}`);
+        this.reconnectStream(subscriptionId);
+      }, 5000);
     });
 
     response.data.on('error', (error: Error) => {
       this.logger.error(`📊 HTTP stream error: ${subscriptionId}`, error);
       this.emit('error', { subscriptionId, error });
       this.handleStreamEnd(subscriptionId);
+      // Attempt to reconnect after 5 seconds
+      setTimeout(() => {
+        this.logger.info(`Attempting to reconnect stream after error: ${subscriptionId}`);
+        this.reconnectStream(subscriptionId);
+      }, 5000);
     });
   }
 
-  // Process buffer for JSON objects  
-  private processBuffer(buffer: string, subscriptionId: string, type: 'bars' | 'quotes'): void {
-    const lines = buffer.split('\n');
-    
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      
-      try {
-        const data = JSON.parse(trimmed);
-        
-        if (data.Error) {
-          this.logger.error(`📊 Stream error for ${subscriptionId}: ${data.Error}`);
-          this.emit('error', { subscriptionId, error: data.Error });
-          continue;
-        }
 
-        // Emit appropriate event based on type
-        if (type === 'bars' && this.isBarData(data)) {
-          this.emit('bar', {
-            subscriptionId,
-            symbol: (data as any).Symbol || this.subscriptions.get(subscriptionId)?.symbols[0],
-            bar: data
-          });
-        } else if (type === 'quotes' && this.isQuoteData(data)) {
-          this.emit('quote', {
-            subscriptionId,
-            symbol: data.Symbol,
-            quote: data
-          });
-        }
-
-      } catch (error) {
-        // Not valid JSON, might be partial - ignore
-        this.logger.debug(`📊 Skipping invalid JSON in stream: ${trimmed.substring(0, 50)}...`);
-      }
-    }
-  }
-
-  // Type guards
-  private isBarData(data: any): data is Bar {
-    return data && typeof data.Close === 'string' && typeof data.Open === 'string';
-  }
-
-  private isQuoteData(data: any): data is Quote {
-    return data && typeof data.Last === 'string' && typeof data.Symbol === 'string';
-  }
 
   // Unsubscribe from a stream
   unsubscribe(subscriptionId: string): void {
@@ -238,6 +259,36 @@ export class TradeStationHttpStreaming extends EventEmitter {
   unsubscribeAll(): void {
     for (const [subscriptionId] of this.subscriptions) {
       this.unsubscribe(subscriptionId);
+    }
+  }
+
+  // Reconnect a stream
+  private async reconnectStream(subscriptionId: string): Promise<void> {
+    // Check if subscription still exists and should reconnect
+    const subscription = this.subscriptions.get(subscriptionId);
+    if (!subscription || !subscription.active) {
+      this.logger.info(`Stream ${subscriptionId} no longer active, skipping reconnect`);
+      return;
+    }
+
+    try {
+      // Resubscribe based on type
+      if (subscription.type === 'bars') {
+        const [symbol] = subscription.symbols;
+        const params = subscription.parameters;
+        await this.subscribeToBars({
+          symbol,
+          interval: params?.interval || 1,
+          unit: params?.unit || 'Minute'
+        });
+      } else if (subscription.type === 'quotes') {
+        await this.subscribeToQuotes(subscription.symbols);
+      }
+      this.logger.info(`Successfully reconnected stream: ${subscriptionId}`);
+    } catch (error) {
+      this.logger.error(`Failed to reconnect stream ${subscriptionId}:`, error);
+      // Try again in 30 seconds
+      setTimeout(() => this.reconnectStream(subscriptionId), 30000);
     }
   }
 
