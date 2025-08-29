@@ -50,10 +50,11 @@ async function runLocalBot() {
         paperTrading: process.env.PAPER_TRADING !== 'false',
         maxPositionValue: parseFloat(process.env.MAX_POSITION_VALUE || '10000'),
         accountId: process.env.TRADESTATION_ACCOUNT_ID,
-        contractMultiplier: 100
+        contractMultiplier: 100,
+        limitOrderBuffer: parseFloat(process.env.LIMIT_ORDER_BUFFER || '0.25')
       },
       logging: {
-        level: process.env.TESTING === 'true' ? 'debug' : (process.env.LOG_LEVEL as any) || 'info',
+        level: (process.env.LOG_LEVEL as any) || 'info',
         file: process.env.LOG_FILE || './logs/straddle-bot.log'
       },
       bigquery: process.env.GOOGLE_CLOUD_PROJECT ? {
@@ -64,7 +65,10 @@ async function runLocalBot() {
         enabled: true,
         intervalMs: 300000, // 5 minutes
         webhookUrl: process.env.HEARTBEAT_WEBHOOK_URL,
-        logPath: './logs/heartbeat.log'
+        logPath: (() => {
+          const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
+          return `./logs/daily/${today}/heartbeat.log`;
+        })()
       }
     };
 
@@ -183,7 +187,18 @@ async function runLocalBot() {
     });
 
     bot.on('error', (error) => {
-      console.error('❌ Straddle Bot error:', error instanceof Error ? error.message : String(error));
+      // Better console error formatting  
+      if (error instanceof Error) {
+        console.error('❌ Straddle Bot error:', error.message);
+        if (error.stack) {
+          console.error('Stack trace:', error.stack);
+        }
+      } else if (typeof error === 'object' && error !== null) {
+        console.error('❌ Straddle Bot error (object):', JSON.stringify(error, null, 2));
+      } else {
+        console.error('❌ Straddle Bot error:', String(error));
+      }
+      
       logger.error('Bot error:', error);
     });
 
@@ -269,14 +284,44 @@ async function runLocalBot() {
     });
     
     bot.on('error', async (error) => {
-      console.error('❌ Straddle Bot error:', error instanceof Error ? error.message : String(error));
+      // Better console error formatting
+      if (error instanceof Error) {
+        console.error('❌ Straddle Bot error:', error.message);
+        if (error.stack) {
+          console.error('Stack trace:', error.stack);
+        }
+      } else if (typeof error === 'object' && error !== null) {
+        console.error('❌ Straddle Bot error (object):', JSON.stringify(error, null, 2));
+      } else {
+        console.error('❌ Straddle Bot error:', String(error));
+      }
+      
       logger.error('Bot error:', error);
       
       try {
+        // Create a readable error message
+        let errorMessage = 'Unknown error';
+        let errorDetails: any = {};
+        
+        if (error instanceof Error) {
+          errorMessage = error.message;
+          errorDetails = {
+            name: error.name,
+            stack: error.stack,
+            cause: (error as any).cause // TypeScript compatibility
+          };
+        } else if (typeof error === 'object' && error !== null) {
+          // Try to extract useful info from error objects
+          errorMessage = JSON.stringify(error, null, 2);
+          errorDetails = { rawError: error };
+        } else {
+          errorMessage = String(error);
+        }
+        
         await notificationService.sendCriticalAlert(
           'Bot Error',
-          error instanceof Error ? error.message : String(error),
-          { stack: error instanceof Error ? error.stack : undefined }
+          errorMessage,
+          errorDetails
         );
       } catch (notificationError) {
         logger.error('Failed to send error notification:', notificationError);
@@ -316,10 +361,35 @@ async function runLocalBot() {
         if (status.currentPosition) {
           console.log('║ 🎯 ACTIVE STRADDLE:                                          ║');
           console.log(`║   Strike: ${status.currentPosition.symbol.padEnd(20)}                        ║`);
-          console.log(`║   Entry: $${status.currentPosition.entryPrice.toFixed(2)} | Current: $${(status.currentPosition.currentPrice || 0).toFixed(2)}                    ║`);
-          console.log(`║   P&L: $${(status.currentPosition.unrealizedPnL || 0).toFixed(2)} (${((status.currentPosition.unrealizedPnL || 0) / (status.currentPosition.entryPrice * 100) * 100).toFixed(1)}%)                                   ║`);
+          console.log(`║   Current Market: $${(status.currentPosition.currentPrice || 0).toFixed(2).padEnd(8)}                               ║`);
+          
+          // Entry Prices Section
+          console.log('║                                                              ║');
+          console.log('║ 💰 ENTRY PRICES:                                            ║');
+          console.log(`║   📊 Quoted Entry: $${status.currentPosition.entryPrice.toFixed(2).padEnd(8)} (used for orders)         ║`);
+          
+          if (status.currentPosition.fillPrice) {
+            const diff = status.currentPosition.fillPrice - status.currentPosition.entryPrice;
+            const diffStr = diff >= 0 ? `+$${diff.toFixed(2)}` : `-$${Math.abs(diff).toFixed(2)}`;
+            console.log(`║   ✅ Fill Price:   $${status.currentPosition.fillPrice.toFixed(2).padEnd(8)} (${diffStr.padEnd(8)})        ║`);
+            console.log(`║   🧮 Using:        FILL PRICE for P&L calculations          ║`);
+          } else {
+            console.log(`║   ⏳ Fill Price:   Confirming... (background check)         ║`);
+            console.log(`║   🧮 Using:        QUOTED PRICE for P&L calculations        ║`);
+          }
+          
+          // P&L Calculation
+          const entryPriceForCalculation = status.currentPosition.fillPrice || status.currentPosition.entryPrice;
+          const positionPnL = status.currentPosition.unrealizedPnL || 0;
+          const positionPnLPercent = ((positionPnL) / (entryPriceForCalculation * 100) * 100);
+          const pnlColor = positionPnL >= 0 ? '🟢' : '🔴';
+          
+          console.log('║                                                              ║');
+          console.log('║ 📈 POSITION P&L:                                            ║');
+          console.log(`║   ${pnlColor} Current P&L: $${positionPnL.toFixed(2).padEnd(8)} (${positionPnLPercent.toFixed(1)}%)             ║`);
+          
           const holdTime = Math.floor((Date.now() - new Date(status.currentPosition.entryTime).getTime()) / 60000);
-          console.log(`║   Hold Time: ${holdTime} minutes                                      ║`);
+          console.log(`║   ⏰ Hold Time:   ${holdTime.toString().padEnd(3)} minutes                              ║`);
         } else {
           console.log('║ 🎯 No active straddle - Waiting for entry time...            ║');
         }
@@ -456,25 +526,37 @@ async function startCloudServer() {
         }
       }, 10 * 60 * 1000); // Every 10 minutes
       
-      // Auto-stop at market close
+      // Auto-stop at market close (4 PM ET)
       const now = new Date();
-      const marketClose = new Date();
-      const targetUTCHour = 20; // 4 PM ET
+      const etNow = new Date(now.toLocaleString("en-US", {timeZone: "America/New_York"}));
+      const currentHour = etNow.getHours();
       
-      marketClose.setUTCHours(targetUTCHour, 0, 0, 0);
-      
-      if (now >= marketClose) {
-        marketClose.setDate(marketClose.getDate() + 1);
+      // If it's already after 4 PM ET, stop immediately
+      if (currentHour >= 16) {
+        logger.info('Market is closed - stopping bot immediately');
+        if (statusInterval) {
+          clearInterval(statusInterval);
+          statusInterval = null;
+        }
+        await bot.stop();
+        bot = null;
+        botStatus = 'stopped';
+        logger.info('Bot stopped - market closed');
+        return;
       }
       
-      const msUntilClose = marketClose.getTime() - now.getTime();
+      // If before 4 PM, schedule shutdown for 4 PM ET today
+      const marketClose = new Date(etNow);
+      marketClose.setHours(16, 0, 0, 0);
+      
+      const msUntilClose = marketClose.getTime() - etNow.getTime();
       const hoursUntilClose = msUntilClose / (1000 * 60 * 60);
       
-      if (hoursUntilClose > 0 && hoursUntilClose < 12) {
-        logger.info(`Auto-stop scheduled for ${marketClose.toISOString()} (${hoursUntilClose.toFixed(1)} hours)`);
+      if (hoursUntilClose > 0) {
+        logger.info(`Auto-stop scheduled for 4:00 PM ET (${hoursUntilClose.toFixed(1)} hours)`);
         setTimeout(async () => {
           if (bot) {
-            logger.info('Market close - stopping bot');
+            logger.info('Market close - stopping bot at 4:00 PM ET');
             
             if (statusInterval) {
               clearInterval(statusInterval);
@@ -485,6 +567,7 @@ async function startCloudServer() {
             bot = null;
             botStatus = 'stopped';
             logger.info('Bot stopped at market close');
+            process.exit(0);
           }
         }, msUntilClose);
       }

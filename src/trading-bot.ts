@@ -93,7 +93,7 @@ export class TradingBot extends EventEmitter {
     this.logger = createLogger('TradingBot', config.logging);
     
     this.apiClient = new TradeStationClient(config.tradeStation);
-    this.streamingClient = new TradeStationHttpStreaming(config.tradeStation);
+    this.streamingClient = new TradeStationHttpStreaming(config.tradeStation, this.apiClient);
     
     this.setupEventListeners();
   }

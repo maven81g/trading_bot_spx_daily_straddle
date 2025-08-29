@@ -55,7 +55,7 @@ async function runLocalBot() {
         accountId: process.env.TRADESTATION_ACCOUNT_ID
       },
       logging: {
-        level: process.env.TESTING === 'true' ? 'debug' : (process.env.LOG_LEVEL as any) || 'info',
+        level: (process.env.LOG_LEVEL as any) || 'info',
         file: process.env.LOG_FILE || './logs/trading-bot.log'
       }
     };

@@ -1,5 +1,6 @@
 import winston from 'winston';
 import path from 'path';
+import fs from 'fs';
 
 // Safe JSON stringify that handles circular references
 function safeStringify(obj: any, indent?: number): string {
@@ -77,14 +78,30 @@ export function createLogger(label: string, config: LoggingConfig = { level: 'in
   // Add file transport if specified
   if (config.file) {
     const logDir = path.dirname(config.file);
+    const baseFileName = path.basename(config.file, path.extname(config.file));
+    const fileExtension = path.extname(config.file);
+    
+    // Create daily directory structure: logs/daily/YYYY-MM-DD/
+    const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
+    const dailyDir = path.join(logDir, 'daily', today);
+    
+    // Ensure daily directory exists
+    if (!fs.existsSync(dailyDir)) {
+      fs.mkdirSync(dailyDir, { recursive: true });
+    }
+    
+    // Create log files in daily directory
+    const dailyLogFile = path.join(dailyDir, `${baseFileName}${fileExtension}`);
+    const dailyErrorFile = path.join(dailyDir, `error.log`);
+    const dailyHeartbeatFile = path.join(dailyDir, `heartbeat.log`);
     
     transports.push(
       new winston.transports.File({
-        filename: config.file,
+        filename: dailyLogFile,
         level: config.level,
         format: logFormat,
         maxsize: 10 * 1024 * 1024, // 10MB
-        maxFiles: 5,
+        maxFiles: 5, // 5 files per day max
         tailable: true
       })
     );
@@ -92,11 +109,11 @@ export function createLogger(label: string, config: LoggingConfig = { level: 'in
     // Add error-only log file
     transports.push(
       new winston.transports.File({
-        filename: path.join(logDir, 'error.log'),
+        filename: dailyErrorFile,
         level: 'error',
         format: logFormat,
         maxsize: 10 * 1024 * 1024, // 10MB
-        maxFiles: 5,
+        maxFiles: 5, // 5 files per day max
         tailable: true
       })
     );

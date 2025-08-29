@@ -140,8 +140,12 @@ export interface OrderRequest {
 
 export interface OrderResponse {
   OrderID?: string;
-  Message: string;
+  Message?: string;
   Error?: string;
+  Orders?: Array<{
+    OrderID: string;
+    Message: string;
+  }>;
 }
 
 export interface Order {

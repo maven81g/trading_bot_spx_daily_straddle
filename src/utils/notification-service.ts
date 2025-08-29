@@ -49,17 +49,13 @@ export interface NotificationMessage {
 export class NotificationService extends EventEmitter {
   private config: NotificationConfig;
   private logger: Logger;
-  private emailTransporter?: nodemailer.Transporter;
 
   constructor(config: NotificationConfig, logger: Logger) {
     super();
     this.config = config;
     this.logger = logger;
 
-    // Initialize email transporter if configured
-    if (config.email?.enabled) {
-      this.emailTransporter = nodemailer.createTransport(config.email.smtp);
-    }
+    // Using Mailgun for email notifications
   }
 
   public async send(notification: NotificationMessage): Promise<void> {
@@ -72,8 +68,8 @@ export class NotificationService extends EventEmitter {
       promises.push(this.sendDiscord(notification));
     }
 
-    if (this.config.email?.enabled) {
-      promises.push(this.sendEmail(notification));
+    if (this.config.mailgun?.enabled) {
+      // promises.push(this.sendMailgun(notification)); // TODO: Implement sendMailgun method
     }
 
     if (this.config.windows?.enabled) {
@@ -141,34 +137,7 @@ export class NotificationService extends EventEmitter {
     }
   }
 
-  private async sendEmail(notification: NotificationMessage): Promise<void> {
-    if (!this.emailTransporter || !this.config.email) return;
-
-    try {
-      const subject = `[${notification.level.toUpperCase()}] ${notification.title}`;
-      
-      const html = `
-        <h2>${this.getEmoji(notification.level)} ${notification.title}</h2>
-        <p>${notification.message}</p>
-        ${notification.details ? `
-          <h3>Details:</h3>
-          <pre>${JSON.stringify(notification.details, null, 2)}</pre>
-        ` : ''}
-        <hr>
-        <small>Sent at ${notification.timestamp?.toLocaleString()}</small>
-      `;
-
-      await this.emailTransporter.sendMail({
-        from: this.config.email.from,
-        to: this.config.email.to.join(', '),
-        subject,
-        html
-      });
-    } catch (error) {
-      this.logger.error('Failed to send email notification:', error);
-      throw error;
-    }
-  }
+  // Email functionality removed - using Mailgun instead
 
   private async sendWindowsNotification(notification: NotificationMessage): Promise<void> {
     if (!this.config.windows?.enabled) return;

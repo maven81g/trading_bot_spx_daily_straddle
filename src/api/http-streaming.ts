@@ -27,10 +27,12 @@ export class TradeStationHttpStreaming extends EventEmitter {
   private logger: Logger;
   private subscriptions: Map<string, StreamingSubscription> = new Map();
   private authToken: AuthToken | null = null;
+  private apiClient: any; // Reference to API client for token refresh
 
-  constructor(config: TradeStationConfig) {
+  constructor(config: TradeStationConfig, apiClient?: any) {
     super();
     this.config = config;
+    this.apiClient = apiClient;
     this.logger = createLogger('TradeStationHttpStreaming');
   }
 
@@ -71,17 +73,9 @@ export class TradeStationHttpStreaming extends EventEmitter {
     this.subscriptions.set(subscriptionId, subscription);
 
     try {
-      // Start HTTP streaming request
-      const response = await axios.get(streamUrl, {
-        headers: {
-          'Authorization': `Bearer ${this.authToken.access_token}`,
-          'Accept': 'application/vnd.tradestation.streams.v2+json',
-        },
-        responseType: 'stream',
-        signal: abortController.signal,
-        timeout: 0 // No timeout for streaming
-      });
-
+      // Start HTTP streaming request with token refresh retry logic
+      const response = await this.startStreamWithRetry(streamUrl, abortController, subscriptionId);
+      
       this.logger.info(`✅ HTTP streaming connected: ${subscriptionId}`);
 
       // Process streaming chunks
@@ -125,16 +119,8 @@ export class TradeStationHttpStreaming extends EventEmitter {
     this.subscriptions.set(id, subscription);
 
     try {
-      // Start HTTP streaming request
-      const response = await axios.get(streamUrl, {
-        headers: {
-          'Authorization': `Bearer ${this.authToken.access_token}`,
-          'Accept': 'application/vnd.tradestation.streams.v2+json',
-        },
-        responseType: 'stream',
-        signal: abortController.signal,
-        timeout: 0 // No timeout for streaming
-      });
+      // Start HTTP streaming request with token refresh retry logic
+      const response = await this.startStreamWithRetry(streamUrl, abortController, id);
 
       this.logger.info(`✅ Quote HTTP streaming connected: ${id}`);
 
@@ -148,6 +134,53 @@ export class TradeStationHttpStreaming extends EventEmitter {
     }
 
     return id;
+  }
+
+  // Start streaming with 401 error handling and token refresh retry
+  private async startStreamWithRetry(streamUrl: string, abortController: AbortController, subscriptionId: string): Promise<AxiosResponse> {
+    let retryCount = 0;
+    const maxRetries = 2;
+
+    while (retryCount < maxRetries) {
+      try {
+        const response = await axios.get(streamUrl, {
+          headers: {
+            'Authorization': `Bearer ${this.authToken?.access_token}`,
+            'Accept': 'application/vnd.tradestation.streams.v2+json',
+          },
+          responseType: 'stream',
+          signal: abortController.signal,
+          timeout: 0 // No timeout for streaming
+        });
+
+        return response;
+
+      } catch (error: any) {
+        // Handle 401 Unauthorized - token expired
+        if (error.response?.status === 401 && this.apiClient && retryCount < maxRetries - 1) {
+          this.logger.warn(`🔄 Stream 401 error for ${subscriptionId}, attempting token refresh (attempt ${retryCount + 1})`);
+          
+          try {
+            // Refresh the token using API client
+            const refreshed = await this.apiClient.refreshAccessToken();
+            if (refreshed) {
+              // Get updated token from API client
+              this.authToken = this.apiClient.authToken;
+              this.logger.info(`✅ Token refreshed for streaming, retrying connection`);
+              retryCount++;
+              continue; // Retry with new token
+            }
+          } catch (refreshError) {
+            this.logger.error(`❌ Token refresh failed for streaming:`, refreshError);
+          }
+        }
+
+        // If not 401 or refresh failed, throw the error
+        throw error;
+      }
+    }
+
+    throw new Error(`Failed to establish streaming connection after ${maxRetries} attempts`);
   }
 
   // Process HTTP streaming response using TradeStation engineer's pattern

@@ -30,8 +30,10 @@ echo [%date% %time%] Starting SPX Straddle Bot... >> "%LOG_FILE%"
 
 cd /d "%BOT_DIR%"
 
-:: Run the bot and capture exit code
-npm run start 2>&1 | tee -a "%LOG_FILE%"
+:: Run the bot and show output in terminal (logs still go to file via npm script)
+echo Starting bot... Please keep this window open to see live output.
+echo ======================================================
+npm run start
 set EXIT_CODE=%ERRORLEVEL%
 
 echo.

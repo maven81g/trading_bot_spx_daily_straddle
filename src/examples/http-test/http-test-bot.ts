@@ -36,7 +36,7 @@ export class HttpTestBot extends EventEmitter {
     
     // Initialize components
     this.apiClient = new TradeStationClient(config.tradeStation);
-    this.streamingClient = new TradeStationHttpStreaming(config.tradeStation);
+    this.streamingClient = new TradeStationHttpStreaming(config.tradeStation, this.apiClient);
     
     this.setupEventListeners();
   }

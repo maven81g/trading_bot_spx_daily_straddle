@@ -8,6 +8,7 @@ import { TradeStationHttpStreaming } from './api/http-streaming';
 import { createLogger } from './utils/logger';
 import { HeartbeatMonitor } from './utils/heartbeat-monitor';
 import { BigQuery } from '@google-cloud/bigquery';
+import { StateManager, BotState, PositionState } from './utils/state-manager';
 import {
   TradeStationConfig,
   Account,
@@ -33,6 +34,7 @@ export interface StraddleBotConfig {
     maxPositionValue: number; // Max dollar amount per straddle
     accountId?: string;
     contractMultiplier: number; // Usually 100 for options
+    limitOrderBuffer?: number; // Buffer amount for limit orders (e.g., 0.25)
   };
   logging: {
     level: 'error' | 'warn' | 'info' | 'debug';
@@ -56,9 +58,12 @@ interface StraddlePosition {
   strike: number;
   callSymbol: string;
   putSymbol: string;
-  callEntryPrice: number;
-  putEntryPrice: number;
-  totalEntryPrice: number;
+  callEntryPrice: number;  // Quoted price at entry
+  putEntryPrice: number;   // Quoted price at entry
+  totalEntryPrice: number; // Quoted total
+  callFillPrice?: number;  // Actual fill price from TradeStation
+  putFillPrice?: number;   // Actual fill price from TradeStation
+  totalFillPrice?: number; // Actual total fill price
   quantity: number;
   targetPrice: number;
   stopPrice?: number;
@@ -80,6 +85,7 @@ export class SPXStraddleBot extends EventEmitter {
   private streamingClient: TradeStationHttpStreaming;
   private bigquery?: BigQuery;
   private heartbeatMonitor?: HeartbeatMonitor;
+  private stateManager: StateManager;
   private accounts: Account[] = [];
   private isRunning = false;
   private startTime: Date | null = null;
@@ -99,6 +105,10 @@ export class SPXStraddleBot extends EventEmitter {
   private currentSPXPrice = 0;
   private currentCallPrice = 0;
   private currentPutPrice = 0;
+  private currentCallBid = 0;
+  private currentCallAsk = 0;
+  private currentPutBid = 0;
+  private currentPutAsk = 0;
   
   // Bar consolidation for SPX price
   private lastBarTimestamp: string | null = null;
@@ -115,7 +125,8 @@ export class SPXStraddleBot extends EventEmitter {
     this.logger = createLogger('SPXStraddleBot', config.logging);
     
     this.apiClient = new TradeStationClient(config.tradeStation);
-    this.streamingClient = new TradeStationHttpStreaming(config.tradeStation);
+    this.streamingClient = new TradeStationHttpStreaming(config.tradeStation, this.apiClient);
+    this.stateManager = new StateManager('./bot-state.json', this.logger);
     
     if (config.bigquery) {
       this.bigquery = new BigQuery({
@@ -201,6 +212,9 @@ export class SPXStraddleBot extends EventEmitter {
       this.logger.info('Starting SPX Straddle Bot...');
       this.startTime = new Date();
       
+      // Recover state from previous session
+      await this.recoverState();
+      
       // Authenticate
       await this.authenticate();
       
@@ -228,6 +242,12 @@ export class SPXStraddleBot extends EventEmitter {
       
       // Subscribe to SPX for price monitoring
       await this.subscribeToSPX();
+      
+      // If we have a recovered position, subscribe to option quotes
+      if (this.currentStraddle && this.currentStraddle.isOpen) {
+        this.logger.info('🔗 Subscribing to quotes for recovered position...');
+        await this.subscribeToOptions(this.currentStraddle.callSymbol, this.currentStraddle.putSymbol);
+      }
       
       // Set up entry time checker
       this.setupEntryTimeChecker();
@@ -347,12 +367,243 @@ export class SPXStraddleBot extends EventEmitter {
     // Check every 30 seconds for better accuracy
     this.entryCheckInterval = setInterval(() => {
       this.checkEntryTime();
+      this.checkMarketCloseShutdown();
     }, 30000); // Every 30 seconds
     
     // Wait a bit for SPX price to arrive, then check
     setTimeout(() => {
       this.checkEntryTime();
     }, 5000); // Check after 5 seconds (enough time for first SPX bar)
+  }
+
+  private checkMarketCloseShutdown(): void {
+    const now = new Date();
+    const etNow = new Date(now.toLocaleString("en-US", {timeZone: "America/New_York"}));
+    const currentHour = etNow.getHours();
+    const currentMinute = etNow.getMinutes();
+    
+    // Check if it's 4:05 PM EST (16:05 in 24-hour format)
+    if (currentHour === 16 && currentMinute >= 5) {
+      this.logger.info('🕐 Market closed at 4:05 PM EST - Shutting down bot');
+      this.logDailySummary();
+      
+      // Gracefully stop the bot
+      this.stop().then(() => {
+        this.logger.info('✅ Bot shutdown complete');
+        process.exit(0);
+      }).catch((error) => {
+        this.logger.error('Error during shutdown:', error);
+        process.exit(1);
+      });
+    }
+  }
+
+  private roundToOptionIncrement(price: number): string {
+    // SPX options trade in $0.05 increments for prices under $3, $0.10 increments above $3
+    // For most SPX straddles, we'll use $0.05 increments
+    const increment = price >= 3 ? 0.10 : 0.05;
+    const rounded = Math.round(price / increment) * increment;
+    return rounded.toFixed(2);
+  }
+
+  private async waitForOrderFills(orderIds: string[], timeoutMs: number = 60000): Promise<boolean> {
+    const startTime = Date.now();
+    const checkInterval = 2000; // Check every 2 seconds
+    
+    this.logger.info(`⏳ Checking fills for orders: ${orderIds.join(', ')}`);
+    
+    while (Date.now() - startTime < timeoutMs) {
+      try {
+        const allFilled = await this.checkOrdersFilled(orderIds);
+        
+        if (allFilled) {
+          return true;
+        }
+        
+        // Wait before next check
+        await new Promise(resolve => setTimeout(resolve, checkInterval));
+        
+      } catch (error) {
+        this.logger.error('Error checking order fills:', error);
+        await new Promise(resolve => setTimeout(resolve, checkInterval));
+      }
+    }
+    
+    this.logger.warn(`⏰ Fill confirmation timeout after ${timeoutMs}ms`);
+    return false;
+  }
+
+  private async checkOrdersFilled(orderIds: string[]): Promise<boolean> {
+    try {
+      // Get all orders and find our specific order IDs
+      const accountId = this.config.trading.accountId || this.accounts[0].AccountID;
+      const ordersResponse = await this.apiClient.getOrders(accountId);
+      
+      if (!ordersResponse.success) {
+        this.logger.error('Failed to get orders:', ordersResponse.error);
+        return false;
+      }
+      
+      const orders = ordersResponse.data;
+      
+      let allFilled = true;
+      let filledCount = 0;
+      
+      for (const orderId of orderIds) {
+        // Find the order by ID
+        const order = orders.find((o: any) => o.OrderID === orderId);
+        
+        if (order) {
+          const status = order.Status;
+          const filled = parseFloat(order.FilledQuantity || '0');
+          const total = parseFloat(order.Quantity || '1');
+          
+          this.logger.debug(`Order ${orderId}: Status=${status}, Filled=${filled}/${total}`);
+          
+          if (status === 'FIL' || status === 'Filled' || filled >= total) {
+            filledCount++;
+            
+            // For filled orders, we need to get the actual fill price from positions or order details
+            // For now, we'll use the limit price as approximation until we get actual fills
+            if (this.currentStraddle) {
+              let fillPrice = 0;
+              
+              // Try to use limit price as approximation for now
+              if (order.LimitPrice) {
+                fillPrice = parseFloat(order.LimitPrice);
+              }
+              
+              if (orderId === this.currentStraddle.callOrderId) {
+                this.currentStraddle.callFillPrice = fillPrice;
+                this.logger.info(`📈 Call order filled (Order: ${orderId}, approx price: $${fillPrice})`);
+              } else if (orderId === this.currentStraddle.putOrderId) {
+                this.currentStraddle.putFillPrice = fillPrice;
+                this.logger.info(`📉 Put order filled (Order: ${orderId}, approx price: $${fillPrice})`);
+              }
+              
+              // Update total fill price if both orders are filled
+              if (this.currentStraddle.callFillPrice && this.currentStraddle.putFillPrice) {
+                this.currentStraddle.totalFillPrice = this.currentStraddle.callFillPrice + this.currentStraddle.putFillPrice;
+                this.logger.info(`💰 Total estimated fill price: $${this.currentStraddle.totalFillPrice.toFixed(2)}`);
+              }
+            }
+          } else if (status === 'REJ' || status === 'Rejected') {
+            this.logger.error(`❌ Order ${orderId} was REJECTED: ${order.StatusDescription}`);
+            allFilled = false;
+          } else {
+            allFilled = false;
+          }
+        } else {
+          this.logger.error(`Order ${orderId} not found in account orders`);
+          allFilled = false;
+        }
+      }
+      
+      if (filledCount > 0) {
+        this.logger.info(`📊 Fill progress: ${filledCount}/${orderIds.length} orders filled`);
+      }
+      
+      return allFilled;
+      
+    } catch (error) {
+      this.logger.error('Error checking order fills:', error);
+      return false;
+    }
+  }
+
+  private async handleUnfilledOrders(orderIds: string[]): Promise<void> {
+    this.logger.warn(`🔍 Handling unfilled orders: ${orderIds.join(', ')}`);
+    
+    try {
+      const accountId = this.config.trading.accountId || this.accounts[0].AccountID;
+      const ordersResponse = await this.apiClient.getOrders(accountId);
+      
+      if (!ordersResponse.success) {
+        this.logger.error('Failed to get orders for cleanup:', ordersResponse.error);
+        return;
+      }
+      
+      const orders = ordersResponse.data;
+      
+      for (const orderId of orderIds) {
+        const order = orders.find((o: any) => o.OrderID === orderId);
+        
+        if (order) {
+          const status = order.Status;
+          
+          this.logger.info(`Order ${orderId} status: ${status} - ${order.StatusDescription}`);
+          
+          // Cancel if still pending
+          if (status === 'ACK' || status === 'Acknowledged' || status === 'PEN' || status === 'Pending') {
+            this.logger.warn(`🚫 Cancelling unfilled order: ${orderId}`);
+            try {
+              await this.apiClient.cancelOrder(orderId);
+            } catch (error) {
+              this.logger.error(`Failed to cancel order ${orderId}:`, error);
+            }
+          }
+        } else {
+          this.logger.warn(`Order ${orderId} not found for cleanup`);
+        }
+      }
+    } catch (error) {
+      this.logger.error('Error in handleUnfilledOrders:', error);
+    }
+  }
+
+  private confirmFillsInBackground(orderIds: string[]): void {
+    this.logger.info(`🔄 Starting background fill confirmation for orders: ${orderIds.join(', ')}`);
+    
+    // Run fill confirmation without blocking position monitoring
+    this.waitForOrderFills(orderIds, 60000)
+      .then((fillsConfirmed) => {
+        if (fillsConfirmed) {
+          this.logger.info(`✅ Background fill confirmation successful - Updated to actual fill prices`);
+        } else {
+          this.logger.warn(`⚠️ Background fill confirmation timeout - Continuing with quoted prices`);
+          this.logger.info(`📊 Position remains active using quoted prices for P&L calculations`);
+          
+          // Check if orders were rejected (but don't cancel position unless all rejected)
+          this.checkOrderStatusForWarnings(orderIds);
+        }
+      })
+      .catch((error) => {
+        this.logger.error('Background fill confirmation error:', error);
+        this.logger.info(`📊 Position continues using quoted prices due to confirmation error`);
+      });
+  }
+
+  private async checkOrderStatusForWarnings(orderIds: string[]): Promise<void> {
+    try {
+      const accountId = this.config.trading.accountId || this.accounts[0].AccountID;
+      const ordersResponse = await this.apiClient.getOrders(accountId);
+      
+      if (!ordersResponse.success) {
+        this.logger.error('Failed to check order status for warnings:', ordersResponse.error);
+        return;
+      }
+      
+      const orders = ordersResponse.data;
+      let rejectedCount = 0;
+      
+      for (const orderId of orderIds) {
+        const order = orders.find((o: any) => o.OrderID === orderId);
+        
+        if (order && (order.Status === 'REJ' || order.Status === 'Rejected')) {
+          rejectedCount++;
+          this.logger.warn(`⚠️ Order ${orderId} was rejected: ${order.StatusDescription}`);
+        }
+      }
+      
+      // If all orders were rejected, we have a problem
+      if (rejectedCount === orderIds.length) {
+        this.logger.error(`🚨 ALL ORDERS REJECTED - Position may not exist but bot is tracking with quoted prices!`);
+        this.logger.error(`🔧 Consider manual intervention or position verification`);
+      }
+      
+    } catch (error) {
+      this.logger.error('Error checking order status for warnings:', error);
+    }
   }
 
   private checkEntryTime(): void {
@@ -371,8 +622,8 @@ export class SPXStraddleBot extends EventEmitter {
     // Log current check status
     this.logger.debug(`Entry check: ${currentHour}:${String(currentMinute).padStart(2, '0')} ET | Target: ${entryHour}:${String(entryMinute).padStart(2, '0')} | SPX: $${this.currentSPXPrice.toFixed(2)}`);
     
-    // Check if it's within 2 minutes of entry time
-    if (currentHour === entryHour && Math.abs(currentMinute - entryMinute) <= 2) {
+    // Check if it's within 1 minute of entry time
+    if (currentHour === entryHour && Math.abs(currentMinute - entryMinute) <= 1) {
       this.logger.info(`🎯 Entry time reached at ${etNow.toLocaleTimeString('en-US', {timeZone: 'America/New_York'})}`);
       
       // Make sure we have SPX price
@@ -432,9 +683,16 @@ export class SPXStraddleBot extends EventEmitter {
       const callQuote = callQuoteResponse.data;
       const putQuote = putQuoteResponse.data;
       
-      // Log the quote details
+      // Log the quote details and store bid/ask
       this.logger.info(`Call quote - Symbol: ${callSymbol}, Bid: ${callQuote.Bid}, Ask: ${callQuote.Ask}, Last: ${callQuote.Last}`);
       this.logger.info(`Put quote - Symbol: ${putSymbol}, Bid: ${putQuote.Bid}, Ask: ${putQuote.Ask}, Last: ${putQuote.Last}`);
+      
+      // Store bid/ask for limit order calculations
+      this.currentCallBid = Number(callQuote.Bid || 0);
+      this.currentCallAsk = Number(callQuote.Ask || 0);
+      this.currentPutBid = Number(putQuote.Bid || 0);
+      this.currentPutAsk = Number(putQuote.Ask || 0);
+      
       const callPrice = Number(callQuote.Ask || callQuote.Last || 0);
       const putPrice = Number(putQuote.Ask || putQuote.Last || 0);
       const totalPrice = callPrice + putPrice;
@@ -488,11 +746,14 @@ export class SPXStraddleBot extends EventEmitter {
       // Place orders if not paper trading
       if (!this.config.trading.paperTrading) {
         await this.placeStraddleOrders();
-        this.logger.info('PAPER TRADE: Straddle entered (no real orders placed)');
       } else {
         // For paper trading, emit success immediately
+        this.logger.info('PAPER TRADE: Straddle entered (no real orders placed)');
         this.totalTrades++;
         this.emit('straddleOpened', this.currentStraddle);
+        
+        // Save state after opening position
+        await this.saveState();
       }
       
       // Subscribe to option quotes for monitoring
@@ -514,24 +775,36 @@ export class SPXStraddleBot extends EventEmitter {
     
     try {
       const accountId = this.config.trading.accountId || this.accounts[0].AccountID;
+      const buffer = this.config.trading.limitOrderBuffer || 0.25;
       
-      // Place call order
+      // Calculate limit prices (mid + buffer for buying)
+      const callMid = (this.currentCallBid + this.currentCallAsk) / 2;
+      const putMid = (this.currentPutBid + this.currentPutAsk) / 2;
+      // Round to nearest $0.05 (SPX options trade in $0.05 increments)
+      const callLimit = this.roundToOptionIncrement(callMid + buffer);
+      const putLimit = this.roundToOptionIncrement(putMid + buffer);
+      
+      this.logger.info(`📊 Order prices - Call: Mid=${callMid.toFixed(2)} Limit=${callLimit} | Put: Mid=${putMid.toFixed(2)} Limit=${putLimit}`);
+      
+      // Place call order with limit
       const callOrder: OrderRequest = {
         AccountID: accountId,
         Symbol: this.currentStraddle.callSymbol,
         Quantity: this.currentStraddle.quantity.toString(),
-        OrderType: 'Market',
+        OrderType: 'Limit',
+        LimitPrice: callLimit,
         TradeAction: 'BUYTOOPEN',
         TimeInForce: { Duration: 'DAY' },
         Route: 'Intelligent'
       };
       
-      // Place put order
+      // Place put order with limit
       const putOrder: OrderRequest = {
         AccountID: accountId,
         Symbol: this.currentStraddle.putSymbol,
         Quantity: this.currentStraddle.quantity.toString(),
-        OrderType: 'Market',
+        OrderType: 'Limit',
+        LimitPrice: putLimit,
         TradeAction: 'BUYTOOPEN',
         TimeInForce: { Duration: 'DAY' },
         Route: 'Intelligent'
@@ -542,28 +815,75 @@ export class SPXStraddleBot extends EventEmitter {
         this.apiClient.placeOrder(putOrder)
       ]);
       
+      // Log detailed responses for debugging
+      this.logger.info(`Call order response - Success: ${callResponse.success}, Data: ${JSON.stringify(callResponse.data)}`);
+      this.logger.info(`Put order response - Success: ${putResponse.success}, Data: ${JSON.stringify(putResponse.data)}`);
+      
       // Track successful orders for potential rollback
       if (callResponse.success) {
-        callOrderId = callResponse.data.OrderID;
-        this.logger.info(`Call order placed: ${callOrderId}`);
-      }
-      if (putResponse.success) {
-        putOrderId = putResponse.data.OrderID;
-        this.logger.info(`Put order placed: ${putOrderId}`);
+        // TradeStation API returns OrderID in Orders array
+        if (callResponse.data?.Orders && Array.isArray(callResponse.data.Orders) && callResponse.data.Orders.length > 0) {
+          callOrderId = callResponse.data.Orders[0].OrderID;
+        } else {
+          // Fallback to check direct properties
+          callOrderId = callResponse.data?.OrderID;
+        }
+        
+        if (!callOrderId) {
+          this.logger.error(`⚠️ Call order response missing OrderID. Full response: ${JSON.stringify(callResponse.data)}`);
+        } else {
+          this.logger.info(`✅ Call order placed successfully: ${callOrderId}`);
+        }
+      } else {
+        this.logger.error(`❌ Call order failed: ${JSON.stringify(callResponse.error || callResponse.data)}`);
       }
       
-      // Both orders must succeed
-      if (callResponse.success && putResponse.success) {
-        this.currentStraddle.callOrderId = callOrderId!;
-        this.currentStraddle.putOrderId = putOrderId!;
+      if (putResponse.success) {
+        // TradeStation API returns OrderID in Orders array
+        if (putResponse.data?.Orders && Array.isArray(putResponse.data.Orders) && putResponse.data.Orders.length > 0) {
+          putOrderId = putResponse.data.Orders[0].OrderID;
+        } else {
+          // Fallback to check direct properties
+          putOrderId = putResponse.data?.OrderID;
+        }
         
-        this.logger.info(`✅ Both orders successful - Call: ${callOrderId}, Put: ${putOrderId}`);
+        if (!putOrderId) {
+          this.logger.error(`⚠️ Put order response missing OrderID. Full response: ${JSON.stringify(putResponse.data)}`);
+        } else {
+          this.logger.info(`✅ Put order placed successfully: ${putOrderId}`);
+        }
+      } else {
+        this.logger.error(`❌ Put order failed: ${JSON.stringify(putResponse.error || putResponse.data)}`);
+      }
+      
+      // Both orders must succeed and have valid IDs
+      if (callResponse.success && putResponse.success && callOrderId && putOrderId) {
+        this.currentStraddle.callOrderId = callOrderId;
+        this.currentStraddle.putOrderId = putOrderId;
         
-        // Only now emit success and increment trade count
+        this.logger.info(`📋 Both orders submitted - Call: ${callOrderId}, Put: ${putOrderId}`);
+        this.logger.info(`⏳ Waiting for fill confirmation before considering position open...`);
+        
+        this.logger.info(`✅ Orders submitted - Starting position monitoring with quoted prices`);
+        
+        // Immediately emit success and start monitoring with quoted prices
         this.totalTrades++;
         this.emit('straddleOpened', this.currentStraddle);
         
+        // Save state immediately after order submission
+        await this.saveState();
+        
+        // Start fill confirmation in background (don't await)
+        this.confirmFillsInBackground([callOrderId, putOrderId]);
+        
       } else {
+        // Log specific failure reason
+        if (!callResponse.success || !putResponse.success) {
+          this.logger.error(`Order placement failed - Call: ${callResponse.success ? 'OK' : 'FAILED'}, Put: ${putResponse.success ? 'OK' : 'FAILED'}`);
+        } else if (!callOrderId || !putOrderId) {
+          this.logger.error(`Orders succeeded but missing IDs - Call ID: ${callOrderId || 'MISSING'}, Put ID: ${putOrderId || 'MISSING'}`);
+        }
+        
         // Rollback: Cancel or close any successful order
         if (callOrderId) {
           this.logger.warn(`❌ Put order failed, handling successful call order: ${callOrderId}`);
@@ -577,7 +897,7 @@ export class SPXStraddleBot extends EventEmitter {
         // Clear the position since orders failed
         this.currentStraddle = null;
         
-        throw new Error(`Orders failed - Call: ${callResponse.success ? 'OK' : 'FAILED'}, Put: ${putResponse.success ? 'OK' : 'FAILED'}`);
+        throw new Error(`Orders failed - Call: ${callResponse.success ? (callOrderId ? 'OK' : 'NO_ID') : 'FAILED'}, Put: ${putResponse.success ? (putOrderId ? 'OK' : 'NO_ID') : 'FAILED'}`);
       }
       
     } catch (error) {
@@ -599,6 +919,311 @@ export class SPXStraddleBot extends EventEmitter {
     }
   }
 
+  private async recoverState(): Promise<void> {
+    try {
+      // First, load saved state for basic stats
+      const state = await this.stateManager.initialize();
+      if (state) {
+        this.logger.info('📂 Loading previous session data...');
+        this.dailyPnL = state.dailyPnL || 0;
+        this.totalTrades = state.totalTrades || 0;
+        this.closedPositions = state.closedPositions.map(p => this.positionStateToStraddle(p));
+        
+        // Restore current position if it exists
+        if (state.currentPosition) {
+          this.currentStraddle = this.positionStateToStraddle(state.currentPosition);
+          this.logger.info(`🔄 Restored current position: ${this.currentStraddle.strike} straddle (${this.currentStraddle.callSymbol}/${this.currentStraddle.putSymbol})`);
+        }
+        
+        if (state.currentSPXPrice) {
+          this.currentSPXPrice = state.currentSPXPrice;
+        }
+      }
+      
+      // Then, check TradeStation for actual open positions (this is authoritative)
+      await this.recoverFromBrokerPositions();
+      
+      // Note: Quote subscription will happen after authentication
+      
+    } catch (error) {
+      this.logger.warn('Failed to recover state, starting fresh:', error);
+    }
+  }
+  
+  private async recoverFromBrokerPositions(): Promise<void> {
+    try {
+      this.logger.info('🔍 Checking TradeStation for open positions...');
+      
+      // Get current positions from TradeStation
+      const accountIds = this.accounts.map(a => a.AccountID);
+      if (accountIds.length === 0) {
+        this.logger.warn('No accounts available to check positions');
+        return;
+      }
+      
+      const positionsResponse = await this.apiClient.getPositions(accountIds);
+      if (!positionsResponse.success || !positionsResponse.data) {
+        this.logger.info('✅ No open positions found on TradeStation');
+        // If we have a saved position but no broker positions, log a warning
+        if (this.currentStraddle) {
+          this.logger.warn('⚠️ Saved position exists but not found on TradeStation - keeping saved position');
+        }
+        return;
+      }
+      
+      const positions = positionsResponse.data;
+      
+      // Look for SPX option positions
+      const spxPositions = positions.filter(p => 
+        p.Symbol.includes('SPXW') && 
+        p.AssetType === 'STOCKOPTION' &&
+        parseFloat(p.Quantity) > 0
+      );
+      
+      if (spxPositions.length === 0) {
+        this.logger.info('✅ No SPX option positions found on TradeStation');
+        // If we have a saved position but no broker positions, log a warning
+        if (this.currentStraddle) {
+          this.logger.warn('⚠️ Saved position exists but not found on TradeStation - keeping saved position');
+        }
+        return;
+      }
+      
+      // Try to identify straddle pairs
+      const straddle = await this.identifyStraddleFromPositions(spxPositions);
+      if (straddle) {
+        // Check if this matches our saved position
+        if (this.currentStraddle && 
+            this.currentStraddle.callSymbol === straddle.callSymbol && 
+            this.currentStraddle.putSymbol === straddle.putSymbol) {
+          this.logger.info('✅ TradeStation positions match saved state - using saved position with broker data validation');
+          // Keep the saved position but validate against broker data
+        } else {
+          // New or different position found on broker
+          this.currentStraddle = straddle;
+          this.logger.info('🔄 Updated position from TradeStation (different from saved state)');
+        }
+        this.logger.info('🎯 RECOVERED ACTIVE STRADDLE FROM TRADESTATION:');
+        this.logger.info(`   Call: ${straddle.callSymbol} @ $${straddle.callEntryPrice.toFixed(2)}`);
+        this.logger.info(`   Put: ${straddle.putSymbol} @ $${straddle.putEntryPrice.toFixed(2)}`);
+        this.logger.info(`   Total Entry: $${straddle.totalEntryPrice.toFixed(2)}`);
+        this.logger.info(`   Strike: ${straddle.strike}`);
+        this.logger.info(`   Quantity: ${straddle.quantity}`);
+        
+        // Subscribe to quotes for monitoring
+        await this.subscribeToOptions(straddle.callSymbol, straddle.putSymbol);
+      } else {
+        this.logger.info(`ℹ️ Found ${spxPositions.length} SPX positions but couldn't identify as straddle`);
+        // Log individual positions for debugging
+        spxPositions.forEach(pos => {
+          this.logger.info(`   ${pos.Symbol}: ${pos.Quantity} @ $${pos.AveragePrice}`);
+        });
+      }
+      
+    } catch (error) {
+      this.logger.error('Failed to recover from broker positions:', error);
+    }
+  }
+  
+  private async identifyStraddleFromPositions(positions: Position[]): Promise<StraddlePosition | null> {
+    // Group by expiration and strike to find potential straddles
+    const grouped = new Map<string, Position[]>();
+    
+    for (const pos of positions) {
+      // Parse symbol: SPXW 250827C6465 or SPXW 250827P6465
+      const match = pos.Symbol.match(/SPXW (\d{6})([CP])(\d+)/);
+      if (!match) continue;
+      
+      const [, expiration, type, strike] = match;
+      const key = `${expiration}_${strike}`;
+      
+      if (!grouped.has(key)) {
+        grouped.set(key, []);
+      }
+      grouped.get(key)!.push(pos);
+    }
+    
+    // Look for pairs with same strike and expiration
+    for (const [key, posGroup] of grouped) {
+      if (posGroup.length !== 2) continue;
+      
+      const callPos = posGroup.find(p => p.Symbol.includes('C'));
+      const putPos = posGroup.find(p => p.Symbol.includes('P'));
+      
+      if (!callPos || !putPos) continue;
+      
+      // Ensure same quantity (straddle)
+      if (callPos.Quantity !== putPos.Quantity) continue;
+      
+      // Extract strike from symbol
+      const match = callPos.Symbol.match(/SPXW \d{6}[CP](\d+)/);
+      if (!match) continue;
+      
+      const strike = parseInt(match[1]);
+      const quantity = parseFloat(callPos.Quantity);
+      const callEntryPrice = parseFloat(callPos.AveragePrice);
+      const putEntryPrice = parseFloat(putPos.AveragePrice);
+      const totalEntryPrice = callEntryPrice + putEntryPrice;
+      
+      // Calculate target and stop prices based on config
+      const targetPrice = totalEntryPrice * (1 + this.config.strategy.targetProfitPercent / 100);
+      const stopPrice = this.config.strategy.stopLossPercent 
+        ? totalEntryPrice * (1 - this.config.strategy.stopLossPercent / 100)
+        : undefined;
+      
+      return {
+        entryTime: new Date(), // We don't know exact entry time, use current
+        spxPrice: this.currentSPXPrice || strike, // Approximate
+        strike,
+        callSymbol: callPos.Symbol,
+        putSymbol: putPos.Symbol,
+        callEntryPrice,
+        putEntryPrice,
+        totalEntryPrice,
+        callFillPrice: callEntryPrice, // These ARE the actual fill prices
+        putFillPrice: putEntryPrice,
+        totalFillPrice: totalEntryPrice,
+        quantity,
+        targetPrice,
+        stopPrice,
+        isOpen: true
+      };
+    }
+    
+    return null;
+  }
+
+  private positionStateToStraddle(pos: PositionState): StraddlePosition {
+    return {
+      entryTime: new Date(pos.entryTime),
+      spxPrice: pos.spxPrice,
+      strike: pos.strike,
+      callSymbol: pos.callSymbol,
+      putSymbol: pos.putSymbol,
+      callEntryPrice: pos.callEntryPrice,
+      putEntryPrice: pos.putEntryPrice,
+      totalEntryPrice: pos.totalEntryPrice,
+      callFillPrice: (pos as any).callFillPrice,
+      putFillPrice: (pos as any).putFillPrice, 
+      totalFillPrice: (pos as any).totalFillPrice,
+      quantity: pos.quantity,
+      targetPrice: pos.targetPrice,
+      stopPrice: pos.stopPrice,
+      callOrderId: pos.callOrderId,
+      putOrderId: pos.putOrderId,
+      isOpen: pos.isOpen,
+      exitReason: pos.exitReason as any,
+      exitTime: pos.exitTime ? new Date(pos.exitTime) : undefined,
+      callExitPrice: pos.callExitPrice,
+      putExitPrice: pos.putExitPrice,
+      totalExitPrice: pos.totalExitPrice,
+      pnl: pos.pnl
+    };
+  }
+
+  private straddleToPositionState(straddle: StraddlePosition): PositionState {
+    return {
+      entryTime: straddle.entryTime.toISOString(),
+      spxPrice: straddle.spxPrice,
+      strike: straddle.strike,
+      callSymbol: straddle.callSymbol,
+      putSymbol: straddle.putSymbol,
+      callEntryPrice: straddle.callEntryPrice,
+      putEntryPrice: straddle.putEntryPrice,
+      totalEntryPrice: straddle.totalEntryPrice,
+      quantity: straddle.quantity,
+      targetPrice: straddle.targetPrice,
+      stopPrice: straddle.stopPrice,
+      callOrderId: straddle.callOrderId,
+      putOrderId: straddle.putOrderId,
+      isOpen: straddle.isOpen,
+      exitReason: straddle.exitReason,
+      exitTime: straddle.exitTime?.toISOString(),
+      callExitPrice: straddle.callExitPrice,
+      putExitPrice: straddle.putExitPrice,
+      totalExitPrice: straddle.totalExitPrice,
+      pnl: straddle.pnl,
+      ...(straddle.callFillPrice && { callFillPrice: straddle.callFillPrice }),
+      ...(straddle.putFillPrice && { putFillPrice: straddle.putFillPrice }),
+      ...(straddle.totalFillPrice && { totalFillPrice: straddle.totalFillPrice })
+    } as any;
+  }
+
+  private async saveState(): Promise<void> {
+    try {
+      const state: BotState = {
+        version: '1.0',
+        lastSaved: new Date().toISOString(),
+        dailyPnL: this.dailyPnL,
+        totalTrades: this.totalTrades,
+        currentPosition: this.currentStraddle ? this.straddleToPositionState(this.currentStraddle) : undefined,
+        closedPositions: this.closedPositions.map(p => this.straddleToPositionState(p)),
+        lastDataReceived: this.lastDataReceived.toISOString(),
+        currentSPXPrice: this.currentSPXPrice
+      };
+      
+      await this.stateManager.save(state);
+    } catch (error) {
+      this.logger.error('Failed to save state:', error);
+    }
+  }
+
+  private async updateFillPrices(): Promise<void> {
+    if (!this.currentStraddle || this.currentStraddle.totalFillPrice) {
+      return; // Already have fill prices
+    }
+    
+    try {
+      // Get fill prices from positions API (more reliable than orders API for fill prices)
+      const accountIds = this.accounts.map(a => a.AccountID);
+      if (accountIds.length === 0) return;
+      
+      const positionsResponse = await this.apiClient.getPositions(accountIds);
+      if (!positionsResponse.success || !positionsResponse.data) return;
+      
+      const positions = positionsResponse.data;
+      
+      // Find our specific positions by symbol
+      const callPosition = positions.find(p => p.Symbol === this.currentStraddle!.callSymbol);
+      const putPosition = positions.find(p => p.Symbol === this.currentStraddle!.putSymbol);
+      
+      let updated = false;
+      
+      // Update call fill price from position
+      if (callPosition && !this.currentStraddle.callFillPrice) {
+        const fillPrice = parseFloat(callPosition.AveragePrice);
+        if (fillPrice > 0) {
+          this.currentStraddle.callFillPrice = fillPrice;
+          updated = true;
+          this.logger.info(`📊 Call fill price updated: $${fillPrice.toFixed(2)} (quoted: $${this.currentStraddle.callEntryPrice.toFixed(2)})`);
+        }
+      }
+      
+      // Update put fill price from position
+      if (putPosition && !this.currentStraddle.putFillPrice) {
+        const fillPrice = parseFloat(putPosition.AveragePrice);
+        if (fillPrice > 0) {
+          this.currentStraddle.putFillPrice = fillPrice;
+          updated = true;
+          this.logger.info(`📊 Put fill price updated: $${fillPrice.toFixed(2)} (quoted: $${this.currentStraddle.putEntryPrice.toFixed(2)})`);
+        }
+      }
+      
+      // Update total fill price if both are available
+      if (this.currentStraddle.callFillPrice && this.currentStraddle.putFillPrice && !this.currentStraddle.totalFillPrice) {
+        this.currentStraddle.totalFillPrice = this.currentStraddle.callFillPrice + this.currentStraddle.putFillPrice;
+        const difference = this.currentStraddle.totalFillPrice - this.currentStraddle.totalEntryPrice;
+        this.logger.info(`📊 Total fill price: $${this.currentStraddle.totalFillPrice.toFixed(2)} (quoted: $${this.currentStraddle.totalEntryPrice.toFixed(2)}, diff: $${difference.toFixed(2)})`);
+        
+        // Save state when we get actual fill prices
+        await this.saveState();
+      }
+      
+    } catch (error) {
+      this.logger.debug('Error updating fill prices:', error);
+    }
+  }
+  
   private async cancelOrCloseOrder(orderId: string, symbol: string, quantity: number): Promise<void> {
     try {
       // First, try to cancel the order (in case it's still pending)
@@ -689,10 +1314,14 @@ export class SPXStraddleBot extends EventEmitter {
       
       if (symbol === this.currentStraddle.callSymbol) {
         this.currentCallPrice = Number(quote.Last || quote.Close || this.currentCallPrice);
-        this.logger.debug(`Call price update: ${symbol} = $${this.currentCallPrice}`);
+        this.currentCallBid = Number(quote.Bid || this.currentCallBid);
+        this.currentCallAsk = Number(quote.Ask || this.currentCallAsk);
+        this.logger.debug(`Call update: ${symbol} = Last:$${this.currentCallPrice} Bid:$${this.currentCallBid} Ask:$${this.currentCallAsk}`);
       } else if (symbol === this.currentStraddle.putSymbol) {
         this.currentPutPrice = Number(quote.Last || quote.Close || this.currentPutPrice);
-        this.logger.debug(`Put price update: ${symbol} = $${this.currentPutPrice}`);
+        this.currentPutBid = Number(quote.Bid || this.currentPutBid);
+        this.currentPutAsk = Number(quote.Ask || this.currentPutAsk);
+        this.logger.debug(`Put update: ${symbol} = Last:$${this.currentPutPrice} Bid:$${this.currentPutBid} Ask:$${this.currentPutAsk}`);
       }
     }
   }
@@ -761,14 +1390,19 @@ export class SPXStraddleBot extends EventEmitter {
     const minute = etNow.getMinutes();
     const isMarketHours = (hour === 9 && minute >= 30) || (hour > 9 && hour < 16);
     
-    // Always log data stream status at info level for visibility
-    this.logger.info(`📊 Data stream check - Last data: ${Math.round(timeSinceLastData / 1000)}s ago | Last bar: ${this.lastBarTimestamp || 'None'} | SPX: $${this.currentSPXPrice.toFixed(2)}`);
+    // Only log data stream issues during market hours to avoid pre-market errors
+    if (isMarketHours) {
+      this.logger.info(`📊 Data stream check - Last data: ${Math.round(timeSinceLastData / 1000)}s ago | Last bar: ${this.lastBarTimestamp || 'None'} | SPX: $${this.currentSPXPrice.toFixed(2)}`);
+    } else {
+      this.logger.debug(`📊 Pre-market check - Last data: ${Math.round(timeSinceLastData / 1000)}s ago | SPX: $${this.currentSPXPrice.toFixed(2)}`);
+    }
     
     // During market hours, be more aggressive about reconnection
     const reconnectThreshold = isMarketHours ? 90000 : maxSilentTime;
     
-    if (timeSinceLastData > reconnectThreshold) {
-      this.logger.warn(`⚠️ No data received for ${Math.round(timeSinceLastData / 1000)} seconds - Stream may be dead`);
+    // Only trigger reconnection during market hours
+    if (isMarketHours && timeSinceLastData > reconnectThreshold) {
+      this.logger.warn(`⚠️ No data received for ${Math.round(timeSinceLastData / 1000)} seconds during market hours - Stream may be dead`);
       
       // Emit critical event if heartbeat monitor is active
       if (this.heartbeatMonitor) {
@@ -799,26 +1433,38 @@ export class SPXStraddleBot extends EventEmitter {
       return;
     }
     
-    const totalCurrentPrice = this.currentCallPrice + this.currentPutPrice;
+    // Update fill prices if not yet captured
+    if (!this.currentStraddle.totalFillPrice) {
+      await this.updateFillPrices();
+    }
     
-    if (totalCurrentPrice <= 0) {
+    // Use bid prices for accurate P&L and exit decisions (what we'd actually get if we sold)
+    const totalBidPrice = this.currentCallBid + this.currentPutBid;
+    const totalLastPrice = this.currentCallPrice + this.currentPutPrice;
+    
+    if (totalBidPrice <= 0) {
       return; // No valid prices yet
     }
     
-    const pnl = (totalCurrentPrice - this.currentStraddle.totalEntryPrice) * this.currentStraddle.quantity * this.config.trading.contractMultiplier;
-    const pnlPercent = ((totalCurrentPrice - this.currentStraddle.totalEntryPrice) / this.currentStraddle.totalEntryPrice) * 100;
+    const entryPrice = this.currentStraddle.totalFillPrice || this.currentStraddle.totalEntryPrice;
+    const pnl = (totalBidPrice - entryPrice) * this.currentStraddle.quantity * this.config.trading.contractMultiplier;
+    const pnlPercent = ((totalBidPrice - entryPrice) / entryPrice) * 100;
     
-    this.logger.debug(`Position monitor - Current: $${totalCurrentPrice.toFixed(2)}, P&L: $${pnl.toFixed(2)} (${pnlPercent.toFixed(1)}%)`);
+    this.logger.debug(`Position monitor - Bid: $${totalBidPrice.toFixed(2)}, Last: $${totalLastPrice.toFixed(2)}, P&L: $${pnl.toFixed(2)} (${pnlPercent.toFixed(1)}%)`);
     
-    // Check exit conditions
-    // 1. Target profit hit
-    if (totalCurrentPrice >= this.currentStraddle.targetPrice) {
-      this.logger.info(`TARGET HIT at ${totalCurrentPrice.toFixed(2)} (${pnlPercent.toFixed(1)}% profit)`);
+    // Check exit conditions using bid prices
+    // 1. Target profit hit (use actual entry price for accurate targeting)
+    const actualTargetPrice = entryPrice * (1 + this.config.strategy.targetProfitPercent / 100);
+    if (totalBidPrice >= actualTargetPrice) {
+      this.logger.info(`TARGET HIT at ${totalBidPrice.toFixed(2)} (${pnlPercent.toFixed(1)}% profit) - Target was $${actualTargetPrice.toFixed(2)}`);
       await this.closeStraddle('TARGET');
     }
-    // 2. Stop loss hit
-    else if (this.currentStraddle.stopPrice && totalCurrentPrice <= this.currentStraddle.stopPrice) {
-      this.logger.info(`STOP LOSS HIT at ${totalCurrentPrice.toFixed(2)} (${pnlPercent.toFixed(1)}% loss)`);
+    // 2. Stop loss hit (use actual entry price for accurate stop loss)
+    const actualStopPrice = this.config.strategy.stopLossPercent 
+      ? entryPrice * (1 - this.config.strategy.stopLossPercent / 100)
+      : null;
+    if (actualStopPrice && totalBidPrice <= actualStopPrice) {
+      this.logger.info(`STOP LOSS HIT at ${totalBidPrice.toFixed(2)} (${pnlPercent.toFixed(1)}% loss) - Stop was $${actualStopPrice.toFixed(2)}`);
       await this.closeStraddle('STOP');
     }
     // 3. End of day exit
@@ -828,7 +1474,7 @@ export class SPXStraddleBot extends EventEmitter {
       const etNow = new Date(now.toLocaleString("en-US", {timeZone: "America/New_York"}));
       
       if (etNow.getHours() >= exitHour && etNow.getMinutes() >= exitMinute) {
-        this.logger.info(`END OF DAY EXIT at ${totalCurrentPrice.toFixed(2)} (${pnlPercent.toFixed(1)}%)`);
+        this.logger.info(`END OF DAY EXIT at ${totalBidPrice.toFixed(2)} (${pnlPercent.toFixed(1)}%)`);
         await this.closeStraddle('EOD');
       }
     }
@@ -845,13 +1491,14 @@ export class SPXStraddleBot extends EventEmitter {
       this.currentStraddle.callExitPrice = this.currentCallPrice;
       this.currentStraddle.putExitPrice = this.currentPutPrice;
       this.currentStraddle.totalExitPrice = this.currentCallPrice + this.currentPutPrice;
-      this.currentStraddle.pnl = (this.currentStraddle.totalExitPrice - this.currentStraddle.totalEntryPrice) * 
+      const actualEntryPrice = this.currentStraddle.totalFillPrice || this.currentStraddle.totalEntryPrice;
+      this.currentStraddle.pnl = (this.currentStraddle.totalExitPrice - actualEntryPrice) * 
                                   this.currentStraddle.quantity * this.config.trading.contractMultiplier;
       this.currentStraddle.isOpen = false;
       
       // Place closing orders if not paper trading
       if (!this.config.trading.paperTrading) {
-        await this.placeClosingOrders();
+        await this.placeClosingOrders(reason);
       }
       
       // Update daily P&L
@@ -868,6 +1515,9 @@ export class SPXStraddleBot extends EventEmitter {
       
       // Emit event
       this.emit('straddleClosed', this.currentStraddle);
+      
+      // Save state after closing position
+      await this.saveState();
       
       // Save to BigQuery if configured
       if (this.bigquery) {
@@ -893,33 +1543,77 @@ export class SPXStraddleBot extends EventEmitter {
     }
   }
 
-  private async placeClosingOrders(): Promise<void> {
+  private async placeClosingOrders(reason: 'TARGET' | 'STOP' | 'EOD' | 'MANUAL_STOP'): Promise<void> {
     if (!this.currentStraddle) return;
     
     try {
       const accountId = this.config.trading.accountId || this.accounts[0].AccountID;
+      const buffer = this.config.trading.limitOrderBuffer || 0.25;
       
-      // Place call closing order
-      const callOrder: OrderRequest = {
-        AccountID: accountId,
-        Symbol: this.currentStraddle.callSymbol,
-        Quantity: this.currentStraddle.quantity.toString(),
-        OrderType: 'Market',
-        TradeAction: 'SELLTOCLOSE',
-        TimeInForce: { Duration: 'DAY' },
-        Route: 'Intelligent'
-      };
+      // Determine order type based on exit reason
+      // Use market orders for stop loss, limit orders for target and EOD
+      const useLimit = reason === 'TARGET' || reason === 'EOD';
       
-      // Place put closing order
-      const putOrder: OrderRequest = {
-        AccountID: accountId,
-        Symbol: this.currentStraddle.putSymbol,
-        Quantity: this.currentStraddle.quantity.toString(),
-        OrderType: 'Market',
-        TradeAction: 'SELLTOCLOSE',
-        TimeInForce: { Duration: 'DAY' },
-        Route: 'Intelligent'
-      };
+      let callOrder: OrderRequest;
+      let putOrder: OrderRequest;
+      
+      if (useLimit) {
+        // Calculate limit prices (mid - buffer for selling)
+        const callMid = (this.currentCallBid + this.currentCallAsk) / 2;
+        const putMid = (this.currentPutBid + this.currentPutAsk) / 2;
+        // Round to nearest $0.05 and don't go below bid
+        const callLimit = this.roundToOptionIncrement(Math.max(this.currentCallBid, callMid - buffer));
+        const putLimit = this.roundToOptionIncrement(Math.max(this.currentPutBid, putMid - buffer));
+        
+        this.logger.info(`📊 Exit limit prices - Call: Mid=${callMid.toFixed(2)} Limit=${callLimit} | Put: Mid=${putMid.toFixed(2)} Limit=${putLimit}`);
+        
+        // Place call closing order with limit
+        callOrder = {
+          AccountID: accountId,
+          Symbol: this.currentStraddle.callSymbol,
+          Quantity: this.currentStraddle.quantity.toString(),
+          OrderType: 'Limit',
+          LimitPrice: callLimit,
+          TradeAction: 'SELLTOCLOSE',
+          TimeInForce: { Duration: 'DAY' },
+          Route: 'Intelligent'
+        };
+        
+        // Place put closing order with limit
+        putOrder = {
+          AccountID: accountId,
+          Symbol: this.currentStraddle.putSymbol,
+          Quantity: this.currentStraddle.quantity.toString(),
+          OrderType: 'Limit',
+          LimitPrice: putLimit,
+          TradeAction: 'SELLTOCLOSE',
+          TimeInForce: { Duration: 'DAY' },
+          Route: 'Intelligent'
+        };
+      } else {
+        // Use market orders for stop loss
+        this.logger.info(`⚠️ Using market orders for ${reason} exit`);
+        
+        callOrder = {
+          AccountID: accountId,
+          Symbol: this.currentStraddle.callSymbol,
+          Quantity: this.currentStraddle.quantity.toString(),
+          OrderType: 'Market',
+          TradeAction: 'SELLTOCLOSE',
+          TimeInForce: { Duration: 'DAY' },
+          Route: 'Intelligent'
+        };
+        
+        putOrder = {
+          AccountID: accountId,
+          Symbol: this.currentStraddle.putSymbol,
+          Quantity: this.currentStraddle.quantity.toString(),
+          OrderType: 'Market',
+          TradeAction: 'SELLTOCLOSE',
+          TimeInForce: { Duration: 'DAY' },
+          Route: 'Intelligent'
+        };
+      }
       
       const [callResponse, putResponse] = await Promise.all([
         this.apiClient.placeOrder(callOrder),
@@ -1016,19 +1710,32 @@ export class SPXStraddleBot extends EventEmitter {
       currentPosition: this.currentStraddle ? {
         symbol: `${this.currentStraddle.strike} Straddle`,
         entryPrice: this.currentStraddle.totalEntryPrice,
-        currentPrice: this.currentCallPrice + this.currentPutPrice,
+        fillPrice: this.currentStraddle.totalFillPrice,
+        // Use bid prices for more accurate P&L (what you'd get if you sold now)
+        currentPrice: this.currentCallBid + this.currentPutBid,
         entryTime: this.currentStraddle.entryTime.toISOString(),
-        unrealizedPnL: ((this.currentCallPrice + this.currentPutPrice) - this.currentStraddle.totalEntryPrice) * 
+        // Calculate P&L using bid prices vs entry price
+        unrealizedPnL: ((this.currentCallBid + this.currentPutBid) - (this.currentStraddle.totalFillPrice || this.currentStraddle.totalEntryPrice)) * 
                        this.currentStraddle.quantity * this.config.trading.contractMultiplier,
         targetPrice: this.currentStraddle.targetPrice,
-        stopPrice: this.currentStraddle.stopPrice
+        stopPrice: this.currentStraddle.stopPrice,
+        quotedPrices: {
+          call: this.currentStraddle.callEntryPrice,
+          put: this.currentStraddle.putEntryPrice,
+          total: this.currentStraddle.totalEntryPrice
+        },
+        fillPrices: this.currentStraddle.totalFillPrice ? {
+          call: this.currentStraddle.callFillPrice,
+          put: this.currentStraddle.putFillPrice,
+          total: this.currentStraddle.totalFillPrice
+        } : null
       } : null,
       closedPositions: this.closedPositions.length,
       activePositions: this.currentStraddle && this.currentStraddle.isOpen ? [{
         symbol: `SPX ${this.currentStraddle.strike} Straddle`,
         quantity: this.currentStraddle.quantity,
         side: 'LONG',
-        unrealizedPnL: ((this.currentCallPrice + this.currentPutPrice) - this.currentStraddle.totalEntryPrice) * 
+        unrealizedPnL: ((this.currentCallPrice + this.currentPutPrice) - (this.currentStraddle.totalFillPrice || this.currentStraddle.totalEntryPrice)) * 
                        this.currentStraddle.quantity * this.config.trading.contractMultiplier
       }] : [],
       config: {
