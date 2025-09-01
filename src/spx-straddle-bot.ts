@@ -328,9 +328,11 @@ export class SPXStraddleBot extends EventEmitter {
       this.heartbeatMonitor.stop();
     }
     
-    // Close any open positions
+    // Save current state before shutdown (DO NOT close positions)
     if (this.currentStraddle && this.currentStraddle.isOpen) {
-      await this.closeStraddle('MANUAL_STOP');
+      this.logger.info('📝 Saving open position state before shutdown...');
+      await this.saveState();
+      this.logger.info(`💾 Position saved: ${this.currentStraddle.strike} straddle (${this.currentStraddle.callSymbol}/${this.currentStraddle.putSymbol})`);
     }
     
     // Unsubscribe from streams
@@ -876,6 +878,17 @@ export class SPXStraddleBot extends EventEmitter {
         // Start fill confirmation in background (don't await)
         this.confirmFillsInBackground([callOrderId, putOrderId]);
         
+        // Set up a one-time fill check after 5 seconds to persist state with fill prices
+        setTimeout(async () => {
+          if (this.currentStraddle && this.currentStraddle.isOpen) {
+            // Use the existing updateFillPrices method to check for actual fill prices
+            await this.updateFillPrices();
+            // Save state again with any fill prices we found
+            await this.saveState();
+            this.logger.info('💾 State saved with fill prices');
+          }
+        }, 5000);
+        
       } else {
         // Log specific failure reason
         if (!callResponse.success || !putResponse.success) {
@@ -954,6 +967,18 @@ export class SPXStraddleBot extends EventEmitter {
     try {
       this.logger.info('🔍 Checking TradeStation for open positions...');
       
+      // Display saved position info first if we have it
+      if (this.currentStraddle) {
+        this.logger.info('📋 Saved position details:');
+        this.logger.info(`   Strike: ${this.currentStraddle.strike}`);
+        this.logger.info(`   Call: ${this.currentStraddle.callSymbol}`);
+        this.logger.info(`   Put: ${this.currentStraddle.putSymbol}`);
+        this.logger.info(`   Entry: $${this.currentStraddle.totalEntryPrice.toFixed(2)} (Call: $${this.currentStraddle.callEntryPrice.toFixed(2)}, Put: $${this.currentStraddle.putEntryPrice.toFixed(2)})`);
+        if (this.currentStraddle.callFillPrice || this.currentStraddle.putFillPrice) {
+          this.logger.info(`   Fills: Call: $${this.currentStraddle.callFillPrice?.toFixed(2) || 'pending'}, Put: $${this.currentStraddle.putFillPrice?.toFixed(2) || 'pending'}`);
+        }
+      }
+      
       // Get current positions from TradeStation
       const accountIds = this.accounts.map(a => a.AccountID);
       if (accountIds.length === 0) {
@@ -984,7 +1009,12 @@ export class SPXStraddleBot extends EventEmitter {
         this.logger.info('✅ No SPX option positions found on TradeStation');
         // If we have a saved position but no broker positions, log a warning
         if (this.currentStraddle) {
-          this.logger.warn('⚠️ Saved position exists but not found on TradeStation - keeping saved position');
+          this.logger.warn('⚠️ Saved position exists but not found on TradeStation');
+          this.logger.warn('   This could mean:');
+          this.logger.warn('   1. Position was closed while bot was down');
+          this.logger.warn('   2. Position expired');
+          this.logger.warn('   3. Account mismatch');
+          this.logger.info('🔄 Keeping saved position for reference - will be cleared at next entry time');
         }
         return;
       }
