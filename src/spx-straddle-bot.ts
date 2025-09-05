@@ -118,6 +118,11 @@ export class SPXStraddleBot extends EventEmitter {
   private positionMonitorInterval: NodeJS.Timeout | null = null;
   private heartbeatInterval: NodeJS.Timeout | null = null;
   private lastDataReceived: Date = new Date();
+  
+  // Entry protection flags
+  private isEnteringPosition: boolean = false;
+  private lastEntryDate: string | null = null;
+  private entryAttemptCount: number = 0;
 
   constructor(config: StraddleBotConfig) {
     super();
@@ -613,6 +618,12 @@ export class SPXStraddleBot extends EventEmitter {
       return; // Already have a position
     }
     
+    // Check if we're already entering a position
+    if (this.isEnteringPosition) {
+      this.logger.debug('Already entering position, skipping duplicate entry check');
+      return;
+    }
+    
     const now = new Date();
     const [entryHour, entryMinute] = this.config.strategy.entryTime.split(':').map(Number);
     
@@ -620,6 +631,13 @@ export class SPXStraddleBot extends EventEmitter {
     const etNow = new Date(now.toLocaleString("en-US", {timeZone: "America/New_York"}));
     const currentHour = etNow.getHours();
     const currentMinute = etNow.getMinutes();
+    const todayDateStr = etNow.toISOString().split('T')[0]; // YYYY-MM-DD
+    
+    // Check if we already entered today
+    if (this.lastEntryDate === todayDateStr) {
+      this.logger.debug(`Already attempted entry today (${todayDateStr}), skipping`);
+      return;
+    }
     
     // Log current check status
     this.logger.debug(`Entry check: ${currentHour}:${String(currentMinute).padStart(2, '0')} ET | Target: ${entryHour}:${String(entryMinute).padStart(2, '0')} | SPX: $${this.currentSPXPrice.toFixed(2)}`);
@@ -634,14 +652,31 @@ export class SPXStraddleBot extends EventEmitter {
         return;
       }
       
+      // Set protection flags BEFORE entering
+      this.isEnteringPosition = true;
+      this.lastEntryDate = todayDateStr;
+      this.entryAttemptCount++;
+      
+      this.logger.info(`🔒 Entry lock engaged - Attempt #${this.entryAttemptCount} for ${todayDateStr}`);
+      
       this.enterStraddle();
     }
   }
 
   private async enterStraddle(): Promise<void> {
+    // Set a timeout to release the lock after 2 minutes (safety mechanism)
+    const lockTimeout = setTimeout(() => {
+      if (this.isEnteringPosition) {
+        this.logger.warn('⚠️ Entry lock timeout - releasing lock after 2 minutes');
+        this.isEnteringPosition = false;
+      }
+    }, 120000); // 2 minutes
+    
     try {
       if (!this.currentSPXPrice || this.currentSPXPrice < 3000 || this.currentSPXPrice > 10000) {
         this.logger.error(`Invalid SPX price: ${this.currentSPXPrice}, skipping entry`);
+        this.isEnteringPosition = false; // Release lock on error
+        clearTimeout(lockTimeout);
         return;
       }
       
@@ -679,6 +714,8 @@ export class SPXStraddleBot extends EventEmitter {
         this.logger.error('Failed to get option quotes');
         this.logger.error(`Call response success: ${callQuoteResponse.success}, data: ${JSON.stringify(callQuoteResponse.data)}`);
         this.logger.error(`Put response success: ${putQuoteResponse.success}, data: ${JSON.stringify(putQuoteResponse.data)}`);
+        this.isEnteringPosition = false; // Release lock on error
+        clearTimeout(lockTimeout);
         return;
       }
       
@@ -701,6 +738,8 @@ export class SPXStraddleBot extends EventEmitter {
       
       if (totalPrice <= 0) {
         this.logger.error('Invalid option prices, skipping entry');
+        this.isEnteringPosition = false; // Release lock on error
+        clearTimeout(lockTimeout);
         return;
       }
       
@@ -711,6 +750,8 @@ export class SPXStraddleBot extends EventEmitter {
       // Check if we have enough capital for 1 straddle
       if (totalCost > this.config.trading.maxPositionValue) {
         this.logger.error(`Straddle too expensive: $${totalCost.toFixed(2)} > Max $${this.config.trading.maxPositionValue}`);
+        this.isEnteringPosition = false; // Release lock on error
+        clearTimeout(lockTimeout);
         return;
       }
       
@@ -756,15 +797,29 @@ export class SPXStraddleBot extends EventEmitter {
         
         // Save state after opening position
         await this.saveState();
+        
+        // Release the entry lock for paper trading
+        this.isEnteringPosition = false;
+        clearTimeout(lockTimeout);
+        this.logger.info(`🔓 Entry lock released after paper trade entry`);
       }
       
       // Subscribe to option quotes for monitoring
       await this.subscribeToOptions(callSymbol, putSymbol);
       
+      // Clear the timeout since we completed successfully
+      clearTimeout(lockTimeout);
+      
     } catch (error) {
       this.logger.error('Failed to enter straddle:', error);
       // Clear position if straddle creation failed
       this.currentStraddle = null;
+      
+      // Release the entry lock on error
+      this.isEnteringPosition = false;
+      clearTimeout(lockTimeout);
+      this.logger.info(`🔓 Entry lock released after enterStraddle error`);
+      
       this.emit('error', error);
     }
   }
@@ -875,6 +930,10 @@ export class SPXStraddleBot extends EventEmitter {
         // Save state immediately after order submission
         await this.saveState();
         
+        // Release the entry lock after successful order placement
+        this.isEnteringPosition = false;
+        this.logger.info(`🔓 Entry lock released after successful order placement`);
+        
         // Start fill confirmation in background (don't await)
         this.confirmFillsInBackground([callOrderId, putOrderId]);
         
@@ -910,11 +969,19 @@ export class SPXStraddleBot extends EventEmitter {
         // Clear the position since orders failed
         this.currentStraddle = null;
         
+        // Release the entry lock on failure
+        this.isEnteringPosition = false;
+        this.logger.info(`🔓 Entry lock released after order failure`);
+        
         throw new Error(`Orders failed - Call: ${callResponse.success ? (callOrderId ? 'OK' : 'NO_ID') : 'FAILED'}, Put: ${putResponse.success ? (putOrderId ? 'OK' : 'NO_ID') : 'FAILED'}`);
       }
       
     } catch (error) {
       this.logger.error('Failed to place straddle orders:', error);
+      
+      // Release the entry lock on exception
+      this.isEnteringPosition = false;
+      this.logger.info(`🔓 Entry lock released after exception`);
       
       // Rollback any successful orders on exception
       if (callOrderId && this.currentStraddle) {
