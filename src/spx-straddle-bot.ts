@@ -1585,9 +1585,10 @@ export class SPXStraddleBot extends EventEmitter {
     try {
       this.currentStraddle.exitTime = new Date();
       this.currentStraddle.exitReason = reason === 'MANUAL_STOP' ? 'EOD' : reason;
-      this.currentStraddle.callExitPrice = this.currentCallPrice;
-      this.currentStraddle.putExitPrice = this.currentPutPrice;
-      this.currentStraddle.totalExitPrice = this.currentCallPrice + this.currentPutPrice;
+      // Use bid prices for exit (what we'd actually receive if we sold)
+      this.currentStraddle.callExitPrice = this.currentCallBid;
+      this.currentStraddle.putExitPrice = this.currentPutBid;
+      this.currentStraddle.totalExitPrice = this.currentCallBid + this.currentPutBid;
       const actualEntryPrice = this.currentStraddle.totalFillPrice || this.currentStraddle.totalEntryPrice;
       this.currentStraddle.pnl = (this.currentStraddle.totalExitPrice - actualEntryPrice) * 
                                   this.currentStraddle.quantity * this.config.trading.contractMultiplier;
